@@ -43,7 +43,7 @@
 
 use axum::{body::Body, extract::State, http::Request, response::Response, Router};
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::StatusCode;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
@@ -70,7 +70,7 @@ pub struct ProxyOptions {
 pub struct ReverseProxy {
     path: String,
     target: String,
-    client: Client<HttpConnector, BoxBody<Bytes, Infallible>>,
+    client: Client<HttpConnector, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
     options: ProxyOptions,
 }
 
@@ -130,16 +130,21 @@ impl ReverseProxy {
             .pool_max_idle_per_host(32)
             .retry_canceled_requests(true)
             .set_host(true)
-            .build(connector);
+            .build::<_, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>(connector);
 
-        Self::new_with_client_and_options(path, target, client, options)
+        Self {
+            path: path.into(),
+            target: target.into(),
+            client,
+            options,
+        }
     }
 
     /// Creates a new `ReverseProxy` instance with a custom HTTP client and default proxy options.
     pub fn new_with_client<S>(
         path: S,
         target: S,
-        client: Client<HttpConnector, BoxBody<Bytes, Infallible>>,
+        client: Client<HttpConnector, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
     ) -> Self
     where
         S: Into<String>,
@@ -186,7 +191,7 @@ impl ReverseProxy {
     pub fn new_with_client_and_options<S>(
         path: S,
         target: S,
-        client: Client<HttpConnector, BoxBody<Bytes, Infallible>>,
+        client: Client<HttpConnector, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
         options: ProxyOptions,
     ) -> Self
     where
@@ -251,16 +256,36 @@ impl ReverseProxy {
 
                 // Create the request body
                 let body = if self.options.buffer_bodies {
-                    BoxBody::new(Full::new(buffered_body.as_ref().unwrap().clone()))
+                    let bytes = buffered_body.as_ref().unwrap_or(&Bytes::new()).clone();
+                    let full = Full::new(bytes);
+                    let mapped = full.map_err(|never: Infallible| match never {});
+                    let mapped = mapped.map_err(|_| {
+                        Box::new(std::io::Error::new(std::io::ErrorKind::Other, "unreachable"))
+                            as Box<dyn std::error::Error + Send + Sync>
+                    });
+                    BoxBody::new(mapped)
                 } else {
                     // For streaming mode, we take ownership of the body and convert it
                     let (parts, body) = req.into_parts();
                     req = Request::from_parts(parts, Body::empty());
-                    // First collect the body to handle errors
-                    match body.collect().await {
-                        Ok(collected) => BoxBody::new(Full::new(collected.to_bytes())),
-                        Err(_) => BoxBody::new(Empty::new()),
+                    // Convert the axum Body into a BoxBody
+                    let mut collected = Vec::new();
+                    let mut body = body;
+                    while let Some(frame) = body.frame().await {
+                        if let Ok(frame) = frame {
+                            if let Some(data) = frame.data_ref() {
+                                collected.extend_from_slice(data);
+                            }
+                        }
                     }
+                    let bytes = Bytes::from(collected);
+                    let full = Full::new(bytes);
+                    let mapped = full.map_err(|never: Infallible| match never {});
+                    let mapped = mapped.map_err(|_| {
+                        Box::new(std::io::Error::new(std::io::ErrorKind::Other, "unreachable"))
+                            as Box<dyn std::error::Error + Send + Sync>
+                    });
+                    BoxBody::new(mapped)
                 };
 
                 builder.body(body).unwrap()
@@ -281,12 +306,17 @@ impl ReverseProxy {
                     );
 
                     let (parts, body) = res.into_parts();
-                    // Convert the Incoming body into an axum Body by collecting it
-                    let body = match body.collect().await {
-                        Ok(collected) => Body::from(collected.to_bytes()),
-                        Err(_) => Body::empty(),
-                    };
-                    let mut response = Response::new(body);
+                    // Convert the Incoming body into an axum Body
+                    let mut collected = Vec::new();
+                    let mut body = body;
+                    while let Some(frame) = body.frame().await {
+                        if let Ok(frame) = frame {
+                            if let Some(data) = frame.data_ref() {
+                                collected.extend_from_slice(data);
+                            }
+                        }
+                    }
+                    let mut response = Response::new(Body::from(collected));
                     *response.status_mut() = parts.status;
                     *response.version_mut() = parts.version;
                     *response.headers_mut() = parts.headers;
