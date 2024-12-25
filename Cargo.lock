@@ -155,6 +155,7 @@ dependencies = [
  "bytes",
  "criterion",
  "futures-util",
+ "http 1.2.0",
  "http-body-util",
  "hyper 1.5.2",
  "hyper-util",
