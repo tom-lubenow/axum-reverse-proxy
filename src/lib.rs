@@ -43,7 +43,6 @@
 
 use axum::{body::Body, extract::State, http::Request, response::Response, Router};
 use bytes as bytes_crate;
-use http::Version;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::StatusCode;
 use hyper_util::{
@@ -52,6 +51,7 @@ use hyper_util::{
 };
 use std::convert::Infallible;
 use tracing::{error, trace};
+use http::{HeaderMap, HeaderValue, Version};
 
 /// Configuration options for the reverse proxy
 #[derive(Clone, Debug, Default)]
@@ -70,10 +70,7 @@ pub struct ProxyOptions {
 pub struct ReverseProxy {
     path: String,
     target: String,
-    client: Client<
-        HttpConnector,
-        BoxBody<bytes_crate::Bytes, Box<dyn std::error::Error + Send + Sync>>,
-    >,
+    client: Client<HttpConnector, BoxBody<bytes_crate::Bytes, Box<dyn std::error::Error + Send + Sync>>>,
     options: ProxyOptions,
 }
 
@@ -231,10 +228,41 @@ impl ReverseProxy {
         BoxBody::new(mapped)
     }
 
+    /// Check if a request is a WebSocket upgrade request
+    fn is_websocket_upgrade(headers: &HeaderMap<HeaderValue>) -> bool {
+        // Check for required WebSocket upgrade headers
+        let has_upgrade = headers
+            .get("upgrade")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
+
+        let has_connection = headers
+            .get("connection")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("upgrade"))
+            .unwrap_or(false);
+
+        let has_websocket_key = headers.contains_key("sec-websocket-key");
+        let has_websocket_version = headers.contains_key("sec-websocket-version");
+
+        has_upgrade && has_connection && has_websocket_key && has_websocket_version
+    }
+
     /// Handles the proxying of a single request to the upstream server.
     async fn proxy_request(&self, mut req: Request<Body>) -> Result<Response<Body>, Infallible> {
         trace!("Proxying request method={} uri={}", req.method(), req.uri());
         trace!("Original headers headers={:?}", req.headers());
+
+        // Check if this is a WebSocket upgrade request
+        if Self::is_websocket_upgrade(req.headers()) {
+            trace!("Detected WebSocket upgrade request");
+            // TODO: Handle WebSocket upgrade
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_IMPLEMENTED)
+                .body(Body::from("WebSocket support coming soon"))
+                .unwrap());
+        }
 
         let mut retries: u32 = 3;
         let mut error_msg;
