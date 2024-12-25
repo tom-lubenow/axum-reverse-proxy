@@ -12,7 +12,7 @@ categories = ["web-programming::http-server", "network-programming"]
 authors = ["Tom Lubenow"]
 
 [dependencies]
-axum = "0.7.9"
+axum = { version = "0.7.9", features = ["ws"] }
 hyper = { version = "1.5.2", features = ["full"] }
 hyper-util = { version = "0.1.10", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 tokio = { version = "1.42.0", features = ["full"] }
@@ -29,6 +29,7 @@ http = "1.0.0"
 reqwest = { version = "0.11.24", features = ["json"] }
 tracing-subscriber = "0.3.18"
 criterion = { version = "0.5.1", features = ["async", "async_tokio", "html_reports"] }
+tokio-tungstenite = "0.21.0"
 
 [[bench]]
 name = "proxy_bench"
