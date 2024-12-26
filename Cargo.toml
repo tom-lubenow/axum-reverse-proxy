@@ -24,12 +24,15 @@ tracing = "0.1.40"
 serde_json = "1.0.114"
 futures-util = "0.3.30"
 http = "1.0.0"
+tokio-tungstenite = "0.21.0"
+url = "2.5.0"
+base64 = "0.21.7"
+sha1 = "0.10.6"
 
 [dev-dependencies]
 reqwest = { version = "0.11.24", features = ["json"] }
 tracing-subscriber = "0.3.18"
 criterion = { version = "0.5.1", features = ["async", "async_tokio", "html_reports"] }
-tokio-tungstenite = "0.21.0"
 
 [[bench]]
 name = "proxy_bench"

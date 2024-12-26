@@ -9,6 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite;
+use tracing::{info, trace};
 use tracing_subscriber::fmt::format::FmtSpan;
 
 async fn websocket_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -19,10 +20,22 @@ async fn handle_socket(mut socket: WebSocket) {
     // Echo server - just send back what we receive
     while let Some(msg) = socket.recv().await {
         if let Ok(msg) = msg {
-            if let Message::Text(text) = msg {
-                if socket.send(Message::Text(text)).await.is_err() {
+            match msg {
+                Message::Text(text) => {
+                    if socket.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Binary(data) => {
+                    if socket.send(Message::Binary(data)).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => {
+                    let _ = socket.send(Message::Close(None)).await;
                     break;
                 }
+                _ => {}
             }
         } else {
             break;
@@ -42,16 +55,18 @@ async fn setup_test_server() -> (SocketAddr, SocketAddr) {
     let app = Router::new().route("/ws", get(websocket_handler));
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
+    info!("Upstream server listening on {}", upstream_addr);
 
     tokio::spawn(async move {
         axum::serve(upstream_listener, app).await.unwrap();
     });
 
     // Create the proxy server
-    let proxy = ReverseProxy::new("/ws", &format!("http://{}", upstream_addr));
-    let proxy_app: Router = Router::new().merge(proxy);
+    let proxy = ReverseProxy::new("/", &format!("http://{}", upstream_addr));
+    let proxy_app: Router = proxy.into();
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
+    info!("Proxy server listening on {}", proxy_addr);
 
     tokio::spawn(async move {
         axum::serve(proxy_listener, proxy_app).await.unwrap();
@@ -62,7 +77,7 @@ async fn setup_test_server() -> (SocketAddr, SocketAddr) {
 
 #[tokio::test]
 async fn test_websocket_upgrade() {
-    let (_upstream_addr, proxy_addr) = setup_test_server().await;
+    let (upstream_addr, proxy_addr) = setup_test_server().await;
 
     // Attempt WebSocket upgrade through the proxy
     let url = format!("ws://127.0.0.1:{}/ws", proxy_addr.port());
@@ -75,7 +90,7 @@ async fn test_websocket_upgrade() {
 
 #[tokio::test]
 async fn test_websocket_echo() {
-    let (_upstream_addr, proxy_addr) = setup_test_server().await;
+    let (upstream_addr, proxy_addr) = setup_test_server().await;
 
     // Create a WebSocket client connection through the proxy
     let url = format!("ws://127.0.0.1:{}/ws", proxy_addr.port());
@@ -104,6 +119,7 @@ async fn test_websocket_close() {
 
     // Create a WebSocket client connection through the proxy
     let url = format!("ws://127.0.0.1:{}/ws", proxy_addr.port());
+    info!("Connecting to WebSocket at {}", url);
     let (mut ws_stream, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("Failed to connect");
@@ -111,13 +127,22 @@ async fn test_websocket_close() {
     // Close the connection
     ws_stream.close(None).await.expect("Failed to close connection");
 
+    // Wait for the close frame response
+    while let Some(msg) = ws_stream.next().await {
+        match msg {
+            Ok(tungstenite::Message::Close(_)) => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+
     // Verify we don't receive any more messages
     assert!(ws_stream.next().await.is_none());
 }
 
 #[tokio::test]
 async fn test_websocket_binary() {
-    let (_upstream_addr, proxy_addr) = setup_test_server().await;
+    let (upstream_addr, proxy_addr) = setup_test_server().await;
 
     // Create a WebSocket client connection through the proxy
     let url = format!("ws://127.0.0.1:{}/ws", proxy_addr.port());

@@ -64,6 +64,10 @@ use tokio_tungstenite::{
 use tracing::{error, trace};
 use http::{HeaderMap, HeaderValue, Version};
 use url::Url;
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Error;
+
+type WebSocket = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
 /// Configuration options for the reverse proxy
 #[derive(Clone, Debug, Default)]
@@ -354,24 +358,16 @@ impl ReverseProxy {
         upstream_request: tokio_tungstenite::tungstenite::handshake::client::Request,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use tokio::time::{timeout, Duration};
-        use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
         use tokio::sync::mpsc;
+        use tokio_tungstenite::tungstenite::Message;
+        use futures_util::stream::StreamExt;
 
-        // Upgrade client connection to WebSocket with timeout
         let upgraded = match timeout(Duration::from_secs(5), hyper::upgrade::on(req)).await {
-            Ok(Ok(upgraded)) => {
-                trace!("Successfully upgraded client connection");
-                upgraded
-            }
-            Ok(Err(e)) => {
-                error!("Failed to upgrade client connection: {}", e);
-                return Err(Box::new(e));
-            }
-            Err(e) => {
-                error!("Timeout upgrading client connection: {}", e);
-                return Err(Box::new(e));
-            }
+            Ok(Ok(upgraded)) => upgraded,
+            Ok(Err(e)) => return Err(Box::new(e)),
+            Err(e) => return Err(Box::new(e)),
         };
+
         let io = TokioIo::new(upgraded);
         let client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
             io,
@@ -379,105 +375,88 @@ impl ReverseProxy {
             None,
         )
         .await;
-        trace!("Upgraded client connection to WebSocket");
 
-        // Connect to upstream WebSocket with timeout
-        let (upstream_ws, response) = match timeout(Duration::from_secs(5), connect_async(upstream_request)).await {
-            Ok(Ok(conn)) => {
-                trace!("Successfully connected to upstream WebSocket");
-                conn
-            }
-            Ok(Err(e)) => {
-                error!("Failed to connect to upstream WebSocket: {}", e);
-                return Err(Box::new(e));
-            }
-            Err(e) => {
-                error!("Timeout connecting to upstream WebSocket: {}", e);
-                return Err(Box::new(e));
-            }
+        let (upstream_ws, _) = match timeout(Duration::from_secs(5), connect_async(upstream_request)).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => return Err(Box::new(e)),
+            Err(e) => return Err(Box::new(e)),
         };
-        trace!("Upstream response status: {}", response.status());
-        trace!("Upstream response headers: {:?}", response.headers());
 
-        // Create channels for coordinating close frames
-        let (close_tx, mut close_rx) = mpsc::channel(1);
+        let (mut client_sender, mut client_receiver) = client_ws.split();
+        let (mut upstream_sender, mut upstream_receiver) = upstream_ws.split();
+
+        let (close_tx, mut close_rx) = mpsc::channel::<()>(1);
         let close_tx_upstream = close_tx.clone();
 
-        // Split both connections into sender and receiver halves
-        let (mut client_tx, mut client_rx) = client_ws.split();
-        let (mut upstream_tx, mut upstream_rx) = upstream_ws.split();
-
-        // Forward messages in both directions
-        let client_to_upstream = async move {
-            while let Some(msg) = client_rx.next().await {
+        let client_to_upstream = tokio::spawn(async move {
+            let mut client_closed = false;
+            while let Some(msg) = client_receiver.next().await {
+                let msg = msg?;
                 match msg {
-                    Ok(msg) => {
-                        trace!("Forwarding message from client to upstream");
-                        if let Message::Close(frame) = msg.clone() {
-                            trace!("Received close frame from client: {:?}", frame);
-                            // Forward close frame to upstream
-                            if let Err(e) = timeout(Duration::from_secs(5), upstream_tx.send(msg)).await {
-                                error!("Timeout sending close frame to upstream: {}", e);
-                            }
-                            // Notify the other task about the close frame
-                            let _ = close_tx_upstream.send(()).await;
-                            break;
-                        }
-                        // Forward other messages with timeout
-                        if let Err(e) = timeout(Duration::from_secs(5), upstream_tx.send(msg)).await {
-                            error!("Timeout forwarding message to upstream: {}", e);
+                    Message::Close(_) => {
+                        if !client_closed {
+                            upstream_sender.send(Message::Close(None)).await?;
+                            close_tx.send(()).await.ok();
+                            client_closed = true;
                             break;
                         }
                     }
-                    Err(e) => {
-                        error!("Error receiving message from client: {}", e);
-                        break;
+                    msg @ Message::Binary(_) | msg @ Message::Text(_) | msg @ Message::Ping(_) | msg @ Message::Pong(_) => {
+                        if !client_closed {
+                            upstream_sender.send(msg).await?;
+                        }
                     }
+                    Message::Frame(_) => {}
                 }
             }
-            trace!("Client to upstream task completed");
-        };
+            if !client_closed {
+                upstream_sender.send(Message::Close(None)).await?;
+                close_tx.send(()).await.ok();
+            }
+            Ok::<_, Error>(())
+        });
 
-        let upstream_to_client = async move {
-            while let Some(msg) = upstream_rx.next().await {
+        let upstream_to_client = tokio::spawn(async move {
+            let mut upstream_closed = false;
+            while let Some(msg) = upstream_receiver.next().await {
+                let msg = msg?;
                 match msg {
-                    Ok(msg) => {
-                        trace!("Forwarding message from upstream to client");
-                        if let Message::Close(frame) = msg.clone() {
-                            trace!("Received close frame from upstream: {:?}", frame);
-                            // Forward close frame to client
-                            if let Err(e) = timeout(Duration::from_secs(5), client_tx.send(msg)).await {
-                                error!("Timeout sending close frame to client: {}", e);
-                            }
-                            // Notify the other task about the close frame
-                            let _ = close_tx.send(()).await;
-                            break;
-                        }
-                        // Forward other messages with timeout
-                        if let Err(e) = timeout(Duration::from_secs(5), client_tx.send(msg)).await {
-                            error!("Timeout forwarding message to client: {}", e);
+                    Message::Close(_) => {
+                        if !upstream_closed {
+                            client_sender.send(Message::Close(None)).await?;
+                            close_tx_upstream.send(()).await.ok();
+                            upstream_closed = true;
                             break;
                         }
                     }
-                    Err(e) => {
-                        error!("Error receiving message from upstream: {}", e);
-                        break;
+                    msg @ Message::Binary(_) | msg @ Message::Text(_) | msg @ Message::Ping(_) | msg @ Message::Pong(_) => {
+                        if !upstream_closed {
+                            client_sender.send(msg).await?;
+                        }
                     }
+                    Message::Frame(_) => {}
                 }
             }
-            trace!("Upstream to client task completed");
-        };
+            if !upstream_closed {
+                client_sender.send(Message::Close(None)).await?;
+                close_tx_upstream.send(()).await.ok();
+            }
+            Ok::<_, Error>(())
+        });
 
-        // Run both forwarding tasks concurrently
         tokio::select! {
-            _ = client_to_upstream => {
-                trace!("Client to upstream task completed");
-            }
-            _ = upstream_to_client => {
-                trace!("Upstream to client task completed");
-            }
             _ = close_rx.recv() => {
-                trace!("Close frame received, shutting down connection");
+                trace!("WebSocket connection closed gracefully");
+            }
+            res = client_to_upstream => {
+                if let Err(e) = res {
+                    error!("Client to upstream task failed: {:?}", e);
+                }
+            }
+            res = upstream_to_client => {
+                if let Err(e) = res {
+                    error!("Upstream to client task failed: {:?}", e);
+                }
             }
         }
 
