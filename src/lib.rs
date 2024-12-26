@@ -43,15 +43,27 @@
 
 use axum::{body::Body, extract::State, http::Request, response::Response, Router};
 use bytes as bytes_crate;
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::StatusCode;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
+    rt::TokioIo,
 };
 use std::convert::Infallible;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        handshake::client::Request as WsRequest,
+        protocol::frame::coding::CloseCode,
+        Message,
+    },
+    WebSocketStream,
+};
 use tracing::{error, trace};
 use http::{HeaderMap, HeaderValue, Version};
+use url::Url;
 
 /// Configuration options for the reverse proxy
 #[derive(Clone, Debug, Default)]
@@ -249,6 +261,229 @@ impl ReverseProxy {
         has_upgrade && has_connection && has_websocket_key && has_websocket_version
     }
 
+    /// Handle WebSocket upgrade and forward frames between client and upstream
+    async fn handle_websocket(
+        &self,
+        req: Request<Body>,
+    ) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+        trace!("Handling WebSocket upgrade request");
+
+        // Get the WebSocket key before upgrading
+        let ws_key = req.headers()
+            .get("sec-websocket-key")
+            .and_then(|key| key.to_str().ok())
+            .ok_or("Missing or invalid Sec-WebSocket-Key header")?;
+
+        // Calculate the WebSocket accept key
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        hasher.update(ws_key.as_bytes());
+        hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        let ws_accept = STANDARD.encode(hasher.finalize());
+
+        // Get the path and query from the request
+        let path_and_query = req.uri().path_and_query()
+            .map(|x| x.as_str())
+            .unwrap_or("");
+
+        trace!("Original path: {}", path_and_query);
+        trace!("Proxy path: {}", self.path);
+
+        // Create upstream WebSocket request
+        let upstream_url = format!(
+            "ws://{}{}",
+            self.target.trim_start_matches("http://"),
+            path_and_query
+        );
+
+        trace!("Connecting to upstream WebSocket at {}", upstream_url);
+
+        // Parse the URL to get the host
+        let url = Url::parse(&upstream_url)?;
+        let host = url.host_str().ok_or("Missing host in URL")?;
+        let port = url.port().unwrap_or(80);
+        let host_header = if port == 80 {
+            host.to_string()
+        } else {
+            format!("{}:{}", host, port)
+        };
+
+        // Forward all headers except host to upstream
+        let mut request = WsRequest::builder()
+            .uri(upstream_url)
+            .header("host", host_header);
+
+        for (key, value) in req.headers() {
+            if key != "host" {
+                request = request.header(key.as_str(), value);
+            }
+        }
+
+        // Build the request
+        let request = request.body(())?;
+
+        // Log the request headers
+        trace!("Upstream request headers: {:?}", request.headers());
+
+        // Return a response that indicates the connection has been upgraded
+        trace!("Returning upgrade response to client");
+        let response = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Accept", ws_accept)
+            .body(Body::empty())?;
+
+        // Spawn a task to handle the WebSocket connection
+        let (parts, body) = req.into_parts();
+        let req = Request::from_parts(parts, body);
+        tokio::spawn(async move {
+            match Self::handle_websocket_connection(req, request).await {
+                Ok(_) => trace!("WebSocket connection closed gracefully"),
+                Err(e) => error!("WebSocket connection error: {}", e),
+            }
+        });
+
+        Ok(response)
+    }
+
+    /// Handle the actual WebSocket connection after the upgrade
+    async fn handle_websocket_connection(
+        req: Request<Body>,
+        upstream_request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use tokio::time::{timeout, Duration};
+        use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+        use tokio::sync::mpsc;
+
+        // Upgrade client connection to WebSocket with timeout
+        let upgraded = match timeout(Duration::from_secs(5), hyper::upgrade::on(req)).await {
+            Ok(Ok(upgraded)) => {
+                trace!("Successfully upgraded client connection");
+                upgraded
+            }
+            Ok(Err(e)) => {
+                error!("Failed to upgrade client connection: {}", e);
+                return Err(Box::new(e));
+            }
+            Err(e) => {
+                error!("Timeout upgrading client connection: {}", e);
+                return Err(Box::new(e));
+            }
+        };
+        let io = TokioIo::new(upgraded);
+        let client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            io,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        trace!("Upgraded client connection to WebSocket");
+
+        // Connect to upstream WebSocket with timeout
+        let (upstream_ws, response) = match timeout(Duration::from_secs(5), connect_async(upstream_request)).await {
+            Ok(Ok(conn)) => {
+                trace!("Successfully connected to upstream WebSocket");
+                conn
+            }
+            Ok(Err(e)) => {
+                error!("Failed to connect to upstream WebSocket: {}", e);
+                return Err(Box::new(e));
+            }
+            Err(e) => {
+                error!("Timeout connecting to upstream WebSocket: {}", e);
+                return Err(Box::new(e));
+            }
+        };
+        trace!("Upstream response status: {}", response.status());
+        trace!("Upstream response headers: {:?}", response.headers());
+
+        // Create channels for coordinating close frames
+        let (close_tx, mut close_rx) = mpsc::channel(1);
+        let close_tx_upstream = close_tx.clone();
+
+        // Split both connections into sender and receiver halves
+        let (mut client_tx, mut client_rx) = client_ws.split();
+        let (mut upstream_tx, mut upstream_rx) = upstream_ws.split();
+
+        // Forward messages in both directions
+        let client_to_upstream = async move {
+            while let Some(msg) = client_rx.next().await {
+                match msg {
+                    Ok(msg) => {
+                        trace!("Forwarding message from client to upstream");
+                        if let Message::Close(frame) = msg.clone() {
+                            trace!("Received close frame from client: {:?}", frame);
+                            // Forward close frame to upstream
+                            if let Err(e) = timeout(Duration::from_secs(5), upstream_tx.send(msg)).await {
+                                error!("Timeout sending close frame to upstream: {}", e);
+                            }
+                            // Notify the other task about the close frame
+                            let _ = close_tx_upstream.send(()).await;
+                            break;
+                        }
+                        // Forward other messages with timeout
+                        if let Err(e) = timeout(Duration::from_secs(5), upstream_tx.send(msg)).await {
+                            error!("Timeout forwarding message to upstream: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error receiving message from client: {}", e);
+                        break;
+                    }
+                }
+            }
+            trace!("Client to upstream task completed");
+        };
+
+        let upstream_to_client = async move {
+            while let Some(msg) = upstream_rx.next().await {
+                match msg {
+                    Ok(msg) => {
+                        trace!("Forwarding message from upstream to client");
+                        if let Message::Close(frame) = msg.clone() {
+                            trace!("Received close frame from upstream: {:?}", frame);
+                            // Forward close frame to client
+                            if let Err(e) = timeout(Duration::from_secs(5), client_tx.send(msg)).await {
+                                error!("Timeout sending close frame to client: {}", e);
+                            }
+                            // Notify the other task about the close frame
+                            let _ = close_tx.send(()).await;
+                            break;
+                        }
+                        // Forward other messages with timeout
+                        if let Err(e) = timeout(Duration::from_secs(5), client_tx.send(msg)).await {
+                            error!("Timeout forwarding message to client: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error receiving message from upstream: {}", e);
+                        break;
+                    }
+                }
+            }
+            trace!("Upstream to client task completed");
+        };
+
+        // Run both forwarding tasks concurrently
+        tokio::select! {
+            _ = client_to_upstream => {
+                trace!("Client to upstream task completed");
+            }
+            _ = upstream_to_client => {
+                trace!("Upstream to client task completed");
+            }
+            _ = close_rx.recv() => {
+                trace!("Close frame received, shutting down connection");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Handles the proxying of a single request to the upstream server.
     async fn proxy_request(&self, mut req: Request<Body>) -> Result<Response<Body>, Infallible> {
         trace!("Proxying request method={} uri={}", req.method(), req.uri());
@@ -257,11 +492,16 @@ impl ReverseProxy {
         // Check if this is a WebSocket upgrade request
         if Self::is_websocket_upgrade(req.headers()) {
             trace!("Detected WebSocket upgrade request");
-            // TODO: Handle WebSocket upgrade
-            return Ok(Response::builder()
-                .status(StatusCode::NOT_IMPLEMENTED)
-                .body(Body::from("WebSocket support coming soon"))
-                .unwrap());
+            match self.handle_websocket(req).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    error!("Failed to handle WebSocket upgrade: {}", e);
+                    return Ok(Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from(format!("WebSocket upgrade failed: {}", e)))
+                        .unwrap());
+                }
+            }
         }
 
         let mut retries: u32 = 3;
