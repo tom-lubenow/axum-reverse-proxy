@@ -37,3 +37,7 @@ criterion = { version = "0.5.1", features = ["async", "async_tokio", "html_repor
 [[bench]]
 name = "proxy_bench"
 harness = false
+
+[[bench]]
+name = "websocket_bench"
+harness = false

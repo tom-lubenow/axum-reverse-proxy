@@ -1,12 +1,18 @@
 //! A flexible and efficient reverse proxy implementation for Axum web applications.
 //!
 //! This crate provides a reverse proxy that can be easily integrated into Axum applications,
-//! allowing for seamless forwarding of HTTP requests to upstream servers. It supports:
+//! allowing for seamless forwarding of HTTP requests and WebSocket connections to upstream servers.
+//! It supports:
 //!
 //! - Path-based routing
 //! - Automatic retry mechanism
 //! - Header forwarding
 //! - Configurable HTTP client settings
+//! - WebSocket proxying with:
+//!   - Automatic upgrade handling
+//!   - Bidirectional message forwarding
+//!   - Text and binary message support
+//!   - Proper close frame handling
 //! - Easy integration with Axum's Router
 //!
 //! # Example
@@ -22,7 +28,7 @@
 //! let app: Router = proxy.into();
 //! ```
 //!
-//!  You can also merge the proxy with an existing router, compatible with arbitrary state:
+//! You can also merge the proxy with an existing router, compatible with arbitrary state:
 //!
 //! ```rust
 //! use axum::{routing::get, Router, response::IntoResponse, extract::State};
@@ -40,6 +46,29 @@
 //!     .merge(ReverseProxy::new("/api", "https://httpbin.org"))
 //!     .with_state(AppState { foo: 42 });
 //! ```
+//!
+//! # WebSocket Support
+//!
+//! The proxy automatically detects WebSocket upgrade requests and handles them appropriately:
+//!
+//! ```rust
+//! use axum::Router;
+//! use axum_reverse_proxy::ReverseProxy;
+//!
+//! // Create a reverse proxy that forwards both HTTP and WebSocket requests
+//! let proxy = ReverseProxy::new("/ws", "http://websocket.example.com");
+//!
+//! // WebSocket connections to /ws will be automatically proxied
+//! let app: Router = proxy.into();
+//! ```
+//!
+//! The proxy handles:
+//! - WebSocket upgrade handshake
+//! - Bidirectional message forwarding
+//! - Text and binary messages
+//! - Ping/Pong frames
+//! - Connection close frames
+//! - Multiple concurrent connections
 
 use axum::{body::Body, extract::State, http::Request, response::Response, Router};
 use bytes as bytes_crate;
@@ -238,7 +267,13 @@ impl ReverseProxy {
         BoxBody::new(mapped)
     }
 
-    /// Check if a request is a WebSocket upgrade request
+    /// Check if a request is a WebSocket upgrade request by examining the headers.
+    ///
+    /// According to the WebSocket protocol specification (RFC 6455), a WebSocket upgrade request must have:
+    /// - An "Upgrade: websocket" header (case-insensitive)
+    /// - A "Connection: Upgrade" header (case-insensitive)
+    /// - A "Sec-WebSocket-Key" header with a base64-encoded 16-byte value
+    /// - A "Sec-WebSocket-Version" header
     fn is_websocket_upgrade(headers: &HeaderMap<HeaderValue>) -> bool {
         // Check for required WebSocket upgrade headers
         let has_upgrade = headers
@@ -259,7 +294,15 @@ impl ReverseProxy {
         has_upgrade && has_connection && has_websocket_key && has_websocket_version
     }
 
-    /// Handle WebSocket upgrade and forward frames between client and upstream
+    /// Handle a WebSocket upgrade request by:
+    /// 1. Validating the upgrade request
+    /// 2. Computing the WebSocket accept key
+    /// 3. Establishing a connection to the upstream server
+    /// 4. Returning an upgrade response to the client
+    /// 5. Spawning a task to handle the WebSocket connection
+    ///
+    /// This function follows the WebSocket protocol specification (RFC 6455) for the upgrade handshake.
+    /// It ensures that all required headers are properly handled and forwarded to the upstream server.
     async fn handle_websocket(
         &self,
         req: Request<Body>,
@@ -346,7 +389,26 @@ impl ReverseProxy {
         Ok(response)
     }
 
-    /// Handle the actual WebSocket connection after the upgrade
+    /// Handle an established WebSocket connection by forwarding frames between the client and upstream server.
+    ///
+    /// This function:
+    /// 1. Upgrades the HTTP connection to a WebSocket connection
+    /// 2. Establishes a WebSocket connection to the upstream server
+    /// 3. Creates two tasks for bidirectional message forwarding:
+    ///    - Client to upstream: forwards messages from the client to the upstream server
+    ///    - Upstream to client: forwards messages from the upstream server to the client
+    /// 4. Handles various WebSocket message types:
+    ///    - Text messages
+    ///    - Binary messages
+    ///    - Ping/Pong messages
+    ///    - Close frames
+    ///
+    /// The connection is maintained until either:
+    /// - A close frame is received from either side
+    /// - An error occurs in the connection
+    /// - The connection is dropped
+    ///
+    /// When a close frame is received, it is properly forwarded to ensure clean connection termination.
     async fn handle_websocket_connection(
         req: Request<Body>,
         upstream_request: tokio_tungstenite::tungstenite::handshake::client::Request,
