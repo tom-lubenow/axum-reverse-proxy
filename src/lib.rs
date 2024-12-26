@@ -43,7 +43,7 @@
 
 use axum::{body::Body, extract::State, http::Request, response::Response, Router};
 use bytes as bytes_crate;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::StatusCode;
 use hyper_util::{
@@ -56,18 +56,12 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{
         handshake::client::Request as WsRequest,
-        protocol::frame::coding::CloseCode,
-        Message,
     },
-    WebSocketStream,
 };
 use tracing::{error, trace};
 use http::{HeaderMap, HeaderValue, Version};
 use url::Url;
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Error;
-
-type WebSocket = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
 /// Configuration options for the reverse proxy
 #[derive(Clone, Debug, Default)]

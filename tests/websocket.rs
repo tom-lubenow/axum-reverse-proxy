@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite;
-use tracing::{info, trace};
+use tracing::info;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 async fn websocket_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -77,7 +77,7 @@ async fn setup_test_server() -> (SocketAddr, SocketAddr) {
 
 #[tokio::test]
 async fn test_websocket_upgrade() {
-    let (upstream_addr, proxy_addr) = setup_test_server().await;
+    let (_upstream_addr, proxy_addr) = setup_test_server().await;
 
     // Attempt WebSocket upgrade through the proxy
     let url = format!("ws://127.0.0.1:{}/ws", proxy_addr.port());
@@ -90,7 +90,7 @@ async fn test_websocket_upgrade() {
 
 #[tokio::test]
 async fn test_websocket_echo() {
-    let (upstream_addr, proxy_addr) = setup_test_server().await;
+    let (_upstream_addr, proxy_addr) = setup_test_server().await;
 
     // Create a WebSocket client connection through the proxy
     let url = format!("ws://127.0.0.1:{}/ws", proxy_addr.port());
@@ -142,7 +142,7 @@ async fn test_websocket_close() {
 
 #[tokio::test]
 async fn test_websocket_binary() {
-    let (upstream_addr, proxy_addr) = setup_test_server().await;
+    let (_upstream_addr, proxy_addr) = setup_test_server().await;
 
     // Create a WebSocket client connection through the proxy
     let url = format!("ws://127.0.0.1:{}/ws", proxy_addr.port());
