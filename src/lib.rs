@@ -73,6 +73,7 @@
 use axum::{body::Body, extract::State, http::Request, response::Response, Router};
 use bytes as bytes_crate;
 use futures_util::SinkExt;
+use http::{HeaderMap, HeaderValue, Version};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::StatusCode;
 use hyper_util::{
@@ -81,16 +82,10 @@ use hyper_util::{
     rt::TokioIo,
 };
 use std::convert::Infallible;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{
-        handshake::client::Request as WsRequest,
-    },
-};
-use tracing::{error, trace};
-use http::{HeaderMap, HeaderValue, Version};
-use url::Url;
 use tokio_tungstenite::tungstenite::Error;
+use tokio_tungstenite::{connect_async, tungstenite::handshake::client::Request as WsRequest};
+use tracing::{error, trace};
+use url::Url;
 
 /// Configuration options for the reverse proxy
 #[derive(Clone, Debug, Default)]
@@ -109,7 +104,10 @@ pub struct ProxyOptions {
 pub struct ReverseProxy {
     path: String,
     target: String,
-    client: Client<HttpConnector, BoxBody<bytes_crate::Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+    client: Client<
+        HttpConnector,
+        BoxBody<bytes_crate::Bytes, Box<dyn std::error::Error + Send + Sync>>,
+    >,
     options: ProxyOptions,
 }
 
@@ -310,7 +308,8 @@ impl ReverseProxy {
         trace!("Handling WebSocket upgrade request");
 
         // Get the WebSocket key before upgrading
-        let ws_key = req.headers()
+        let ws_key = req
+            .headers()
             .get("sec-websocket-key")
             .and_then(|key| key.to_str().ok())
             .ok_or("Missing or invalid Sec-WebSocket-Key header")?;
@@ -324,9 +323,7 @@ impl ReverseProxy {
         let ws_accept = STANDARD.encode(hasher.finalize());
 
         // Get the path and query from the request
-        let path_and_query = req.uri().path_and_query()
-            .map(|x| x.as_str())
-            .unwrap_or("");
+        let path_and_query = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("");
 
         trace!("Original path: {}", path_and_query);
         trace!("Proxy path: {}", self.path);
@@ -413,10 +410,10 @@ impl ReverseProxy {
         req: Request<Body>,
         upstream_request: tokio_tungstenite::tungstenite::handshake::client::Request,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use tokio::time::{timeout, Duration};
-        use tokio::sync::mpsc;
-        use tokio_tungstenite::tungstenite::Message;
         use futures_util::stream::StreamExt;
+        use tokio::sync::mpsc;
+        use tokio::time::{timeout, Duration};
+        use tokio_tungstenite::tungstenite::Message;
 
         let upgraded = match timeout(Duration::from_secs(5), hyper::upgrade::on(req)).await {
             Ok(Ok(upgraded)) => upgraded,
@@ -432,11 +429,12 @@ impl ReverseProxy {
         )
         .await;
 
-        let (upstream_ws, _) = match timeout(Duration::from_secs(5), connect_async(upstream_request)).await {
-            Ok(Ok(conn)) => conn,
-            Ok(Err(e)) => return Err(Box::new(e)),
-            Err(e) => return Err(Box::new(e)),
-        };
+        let (upstream_ws, _) =
+            match timeout(Duration::from_secs(5), connect_async(upstream_request)).await {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => return Err(Box::new(e)),
+                Err(e) => return Err(Box::new(e)),
+            };
 
         let (mut client_sender, mut client_receiver) = client_ws.split();
         let (mut upstream_sender, mut upstream_receiver) = upstream_ws.split();
@@ -457,7 +455,10 @@ impl ReverseProxy {
                             break;
                         }
                     }
-                    msg @ Message::Binary(_) | msg @ Message::Text(_) | msg @ Message::Ping(_) | msg @ Message::Pong(_) => {
+                    msg @ Message::Binary(_)
+                    | msg @ Message::Text(_)
+                    | msg @ Message::Ping(_)
+                    | msg @ Message::Pong(_) => {
                         if !client_closed {
                             upstream_sender.send(msg).await?;
                         }
@@ -485,7 +486,10 @@ impl ReverseProxy {
                             break;
                         }
                     }
-                    msg @ Message::Binary(_) | msg @ Message::Text(_) | msg @ Message::Ping(_) | msg @ Message::Pong(_) => {
+                    msg @ Message::Binary(_)
+                    | msg @ Message::Text(_)
+                    | msg @ Message::Ping(_)
+                    | msg @ Message::Pong(_) => {
                         if !upstream_closed {
                             client_sender.send(msg).await?;
                         }

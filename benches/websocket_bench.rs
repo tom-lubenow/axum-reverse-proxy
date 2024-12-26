@@ -68,7 +68,11 @@ async fn setup_test_server() -> (SocketAddr, SocketAddr) {
     (upstream_addr, proxy_addr)
 }
 
-async fn bench_websocket_echo(proxy_addr: SocketAddr, message_size: usize, iterations: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn bench_websocket_echo(
+    proxy_addr: SocketAddr,
+    message_size: usize,
+    iterations: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create a WebSocket client connection through the proxy
     let url = format!("ws://127.0.0.1:{}/ws", proxy_addr.port());
     let (mut ws_stream, _) = tokio_tungstenite::connect_async(&url).await?;
@@ -106,7 +110,8 @@ fn websocket_benchmark(c: &mut Criterion) {
     for size in message_sizes {
         let bench_name = format!("websocket_echo_{}_bytes", size);
         c.bench_function(&bench_name, |b| {
-            b.to_async(&rt).iter(|| bench_websocket_echo(proxy_addr, size, 100));
+            b.to_async(&rt)
+                .iter(|| bench_websocket_echo(proxy_addr, size, 100));
         });
     }
 
@@ -131,4 +136,4 @@ fn websocket_benchmark(c: &mut Criterion) {
 }
 
 criterion_group!(benches, websocket_benchmark);
-criterion_main!(benches); 
+criterion_main!(benches);

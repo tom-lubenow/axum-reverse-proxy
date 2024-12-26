@@ -100,7 +100,8 @@ async fn test_websocket_echo() {
 
     // Send a test message
     let test_message = "Hello, WebSocket!";
-    ws_stream.send(tungstenite::Message::Text(test_message.into()))
+    ws_stream
+        .send(tungstenite::Message::Text(test_message.into()))
         .await
         .expect("Failed to send message");
 
@@ -125,7 +126,10 @@ async fn test_websocket_close() {
         .expect("Failed to connect");
 
     // Close the connection
-    ws_stream.close(None).await.expect("Failed to close connection");
+    ws_stream
+        .close(None)
+        .await
+        .expect("Failed to close connection");
 
     // Wait for the close frame response
     while let Some(msg) = ws_stream.next().await {
@@ -152,7 +156,8 @@ async fn test_websocket_binary() {
 
     // Send a binary message
     let test_data = vec![1, 2, 3, 4, 5];
-    ws_stream.send(tungstenite::Message::Binary(test_data.clone()))
+    ws_stream
+        .send(tungstenite::Message::Binary(test_data.clone()))
         .await
         .expect("Failed to send binary message");
 
@@ -163,4 +168,4 @@ async fn test_websocket_binary() {
     } else {
         panic!("Did not receive response");
     }
-} 
+}
