@@ -125,7 +125,6 @@
 //! - Connection close frames
 //! - Multiple concurrent connections
 
-mod body;
 mod proxy;
 mod rfc9110;
 mod router;
