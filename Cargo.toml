@@ -12,6 +12,7 @@ categories = ["web-programming::http-server", "network-programming"]
 authors = ["Tom Lubenow"]
 
 [dependencies]
+async-stream = "0.3.6"
 axum = { version = "0.8.1", features = ["ws"] }
 base64 = "0.22.1"
 bytes = "1.9.0"
