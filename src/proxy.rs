@@ -6,7 +6,7 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use std::convert::Infallible;
 use tracing::{error, trace};
 
-use crate::{body, websocket};
+use crate::websocket;
 
 /// Configuration options for the reverse proxy
 #[derive(Clone, Debug, Default)]
@@ -25,13 +25,7 @@ pub struct ProxyOptions {
 pub struct ReverseProxy {
     path: String,
     target: String,
-    client: Client<
-        HttpConnector,
-        http_body_util::combinators::BoxBody<
-            bytes_crate::Bytes,
-            Box<dyn std::error::Error + Send + Sync>,
-        >,
-    >,
+    client: Client<HttpConnector, Body>,
     options: ProxyOptions,
 }
 
@@ -91,26 +85,13 @@ impl ReverseProxy {
             .pool_max_idle_per_host(32)
             .retry_canceled_requests(true)
             .set_host(true)
-            .build::<_, http_body_util::combinators::BoxBody<
-                bytes_crate::Bytes,
-                Box<dyn std::error::Error + Send + Sync>,
-            >>(connector);
+            .build(connector);
 
         Self::new_with_client_and_options(path, target, client, options)
     }
 
     /// Creates a new `ReverseProxy` instance with a custom HTTP client and default proxy options.
-    pub fn new_with_client<S>(
-        path: S,
-        target: S,
-        client: Client<
-            HttpConnector,
-            http_body_util::combinators::BoxBody<
-                bytes_crate::Bytes,
-                Box<dyn std::error::Error + Send + Sync>,
-            >,
-        >,
-    ) -> Self
+    pub fn new_with_client<S>(path: S, target: S, client: Client<HttpConnector, Body>) -> Self
     where
         S: Into<String>,
     {
@@ -134,8 +115,7 @@ impl ReverseProxy {
     /// ```rust
     /// use axum_reverse_proxy::{ReverseProxy, ProxyOptions};
     /// use hyper_util::client::legacy::{Client, connect::HttpConnector};
-    /// use http_body_util::{combinators::BoxBody, Empty};
-    /// use bytes::Bytes;
+    /// use axum::body::Body;
     /// use hyper_util::rt::TokioExecutor;
     ///
     /// let client = Client::builder(TokioExecutor::new())
@@ -151,13 +131,7 @@ impl ReverseProxy {
     pub fn new_with_client_and_options<S>(
         path: S,
         target: S,
-        client: Client<
-            HttpConnector,
-            http_body_util::combinators::BoxBody<
-                bytes_crate::Bytes,
-                Box<dyn std::error::Error + Send + Sync>,
-            >,
-        >,
+        client: Client<HttpConnector, Body>,
         options: ProxyOptions,
     ) -> Self
     where
@@ -253,23 +227,13 @@ impl ReverseProxy {
 
                 // Create the request body
                 let body = if self.options.buffer_bodies {
-                    let bytes = buffered_body
-                        .as_ref()
-                        .unwrap_or(&bytes_crate::Bytes::new())
-                        .clone();
-                    body::create_box_body(bytes)
+                    // Only buffer if explicitly requested
+                    Body::from(buffered_body.as_ref().unwrap().clone())
                 } else {
-                    // For streaming mode, we take ownership of the body and convert it
+                    // For streaming mode, simply take the body as is
                     let (parts, body) = req.into_parts();
                     req = axum::http::Request::from_parts(parts, Body::empty());
-
-                    // Convert the axum Body into a BoxBody
-                    let bytes = body
-                        .collect()
-                        .await
-                        .map(|collected| collected.to_bytes())
-                        .unwrap_or_else(|_| bytes_crate::Bytes::new());
-                    body::create_box_body(bytes)
+                    body
                 };
 
                 builder.body(body).unwrap()
@@ -291,14 +255,18 @@ impl ReverseProxy {
 
                     let (parts, body) = res.into_parts();
 
-                    // Convert the response body into a streaming axum Body
-                    let bytes = body
-                        .collect()
-                        .await
-                        .map(|collected| collected.to_bytes())
-                        .unwrap_or_else(|_| bytes_crate::Bytes::new());
-                    let boxed = body::create_box_body(bytes);
-                    let body = Body::new(boxed);
+                    // Convert the response body
+                    let body = if self.options.buffer_bodies {
+                        // Only buffer if explicitly requested
+                        let bytes = body
+                            .collect()
+                            .await
+                            .map(|collected| collected.to_bytes())
+                            .unwrap_or_else(|_| bytes_crate::Bytes::new());
+                        Body::from(bytes)
+                    } else {
+                        Body::from_stream(body.into_data_stream())
+                    };
 
                     let mut response = axum::http::Response::new(body);
                     *response.status_mut() = parts.status;
