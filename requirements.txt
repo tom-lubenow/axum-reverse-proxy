@@ -1,0 +1,5 @@
+matplotlib>=3.8.0
+pandas>=2.1.0
+seaborn>=0.13.0
+jq>=1.6.0
+markdown>=3.5.0 
