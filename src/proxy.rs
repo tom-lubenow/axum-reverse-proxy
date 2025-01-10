@@ -1,9 +1,9 @@
 use axum::body::Body;
-use http::{StatusCode, Version};
+use http::StatusCode;
 use http_body_util::BodyExt;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use std::convert::Infallible;
-use tracing::{error, trace};
+use tracing::error;
 
 use crate::websocket;
 
@@ -110,12 +110,8 @@ impl ReverseProxy {
         &self,
         mut req: axum::http::Request<Body>,
     ) -> Result<axum::http::Response<Body>, Infallible> {
-        trace!("Proxying request method={} uri={}", req.method(), req.uri());
-        trace!("Original headers headers={:?}", req.headers());
-
         // Check if this is a WebSocket upgrade request
         if websocket::is_websocket_upgrade(req.headers()) {
-            trace!("Detected WebSocket upgrade request");
             match websocket::handle_websocket(req, &self.target).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
@@ -135,7 +131,6 @@ impl ReverseProxy {
             let forward_req = {
                 let mut builder = axum::http::Request::builder()
                     .method(req.method().clone())
-                    .version(Version::HTTP_11)
                     .uri(format!(
                         "{}{}",
                         self.target,
@@ -155,20 +150,8 @@ impl ReverseProxy {
                 builder.body(body).unwrap()
             };
 
-            trace!(
-                "Forwarding headers forwarded_headers={:?}",
-                forward_req.headers()
-            );
-
             match self.client.request(forward_req).await {
                 Ok(res) => {
-                    trace!(
-                        "Received response status={} headers={:?} version={:?}",
-                        res.status(),
-                        res.headers(),
-                        res.version()
-                    );
-
                     let (parts, body) = res.into_parts();
                     let body = Body::from_stream(body.into_data_stream());
 
