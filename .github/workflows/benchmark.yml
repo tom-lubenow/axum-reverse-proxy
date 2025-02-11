@@ -22,6 +22,11 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
     - name: Setup Python
       uses: actions/setup-python@v4
       with:
@@ -31,15 +36,25 @@ jobs:
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install matplotlib seaborn pandas jq
+        pip install matplotlib>=3.8.0 pandas>=2.1.0 seaborn>=0.13.0 jq>=1.6.0 markdown>=3.5.0
 
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v1
       with:
         credentials_json: ${{ secrets.GCP_SA_KEY }}
+        project_id: ${{ env.PROJECT_ID }}
+        token_format: 'access_token'
+        workload_identity_provider: ''
 
     - name: Set up Cloud SDK
       uses: google-github-actions/setup-gcloud@v1
+      with:
+        install_components: 'gke-gcloud-auth-plugin'
+
+    - name: Configure Docker
+      run: |
+        gcloud auth configure-docker gcr.io --quiet
+        docker login -u oauth2accesstoken -p "$(gcloud auth print-access-token)" https://gcr.io
 
     - name: Get GKE credentials
       uses: google-github-actions/get-gke-credentials@v1
@@ -55,13 +70,14 @@ jobs:
         ./benchmarks/run-comprehensive-benchmark.sh
 
     - name: Generate plots
-      run: python generate_plots.py
-
-    - name: Prepare benchmark results
       run: |
-        mkdir -p benchmark_results
-        cp -r benchmarks/results/* benchmark_results/
-        cp generate_plots.py benchmark_results/
+        chmod +x benchmarks/scripts/generate_plots.py
+        python benchmarks/scripts/generate_plots.py benchmarks/results/latest.json
+
+    - name: Generate HTML report
+      run: |
+        chmod +x benchmarks/scripts/generate_report.py
+        python benchmarks/scripts/generate_report.py
 
     - name: Deploy to benchmark-results branch
       uses: peaceiris/actions-gh-pages@v3
