@@ -222,9 +222,17 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
         if path == "/" && !self.path.is_empty() {
             // When accessing the root of a proxy path, don't add a trailing slash
             target.to_string()
-        } else if path.starts_with(&self.path) {
+        } else if !base_path.is_empty()
+            && (path == base_path
+                || path.starts_with(&format!("{}/", base_path))
+                || path.starts_with(&format!("{}?", base_path)))
+        {
             let remaining = &path[base_path.len()..];
-            format!("{}{}", target, remaining)
+            if remaining.is_empty() {
+                target.to_string()
+            } else {
+                format!("{}{}", target, remaining)
+            }
         } else {
             format!("{}{}", target, path)
         }

@@ -374,7 +374,9 @@ fn process_connection_header(request: &mut Request<Body>) {
                 let header = header.trim().to_ascii_lowercase();
                 // Try to parse as a header name, if it fails, skip it
                 if let Ok(header_name) = HeaderName::from_str(&header) {
-                    headers_to_remove.insert(header_name);
+                    if !header_name.as_str().eq_ignore_ascii_case("cache-control") {
+                        headers_to_remove.insert(header_name);
+                    }
                 }
             }
         }
@@ -480,7 +482,9 @@ fn process_response_headers(response: &mut Response<Body>) {
                 let header = header.trim();
                 // Try to parse as a header name, if it fails, skip it
                 if let Ok(header_name) = HeaderName::from_str(header) {
-                    headers_to_remove.insert(header_name);
+                    if !header_name.as_str().eq_ignore_ascii_case("cache-control") {
+                        headers_to_remove.insert(header_name);
+                    }
                 }
             }
         }

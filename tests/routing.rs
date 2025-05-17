@@ -414,3 +414,56 @@ async fn test_proxy_query_parameters() {
     proxy_server.abort();
     test_server.abort();
 }
+
+#[tokio::test]
+async fn test_proxy_trailing_slash_path() {
+    // Create a test server that echoes the exact path it receives
+    let echo_handler = get(|req: Request<Body>| async move {
+        let path = req.uri().path();
+        Json(json!({ "received_path": path }))
+    });
+    let app = Router::new()
+        .route("/", echo_handler.clone())
+        .route("/{*path}", echo_handler);
+
+    let test_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let test_addr = test_listener.local_addr().unwrap();
+    let test_server = tokio::spawn(async move {
+        axum::serve(test_listener, app).await.unwrap();
+    });
+
+    // Configure proxy with a trailing slash in the base path
+    let proxy = ReverseProxy::new("/api/", &format!("http://{}", test_addr));
+    let app: Router = proxy.into();
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_server = tokio::spawn(async move {
+        axum::serve(proxy_listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // Request without trailing slash should still map to root of upstream
+    let response = client
+        .get(format!("http://{}/api", proxy_addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["received_path"], "/");
+
+    // Request with query parameters should also work
+    let response = client
+        .get(format!("http://{}/api?foo=bar", proxy_addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["received_path"], "/");
+
+    proxy_server.abort();
+    test_server.abort();
+}

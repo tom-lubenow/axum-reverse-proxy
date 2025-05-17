@@ -26,7 +26,7 @@ where
     S: Send + Sync + Clone + 'static,
 {
     fn from(proxy: ReverseProxy<C>) -> Self {
-        let path = proxy.path().to_string();
+        let path = proxy.path().trim_end_matches('/').to_string();
         let proxy_router = Router::new()
             .fallback(|State(proxy): State<ReverseProxy<C>>, req| async move {
                 proxy.proxy_request(req).await
