@@ -127,9 +127,11 @@
 //! - Multiple concurrent connections
 
 mod proxy;
+mod retry;
 mod rfc9110;
 mod router;
 mod websocket;
 
 pub use proxy::ReverseProxy;
+pub use retry::{RetryConfig, RetryLayer};
 pub use rfc9110::{Rfc9110Config, Rfc9110Layer};
