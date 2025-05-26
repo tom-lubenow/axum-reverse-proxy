@@ -307,7 +307,8 @@ async fn handle_websocket_connection(
 
 #[cfg(test)]
 mod tests {
-    use super::compute_host_header;
+    use super::{compute_host_header, is_websocket_upgrade};
+    use http::{HeaderMap, HeaderValue};
 
     #[test]
     fn host_header_ws_default_port() {
@@ -328,5 +329,67 @@ mod tests {
         let (host, port) = compute_host_header("wss://example.com:8443/path");
         assert_eq!(host, "example.com:8443");
         assert_eq!(port, 8443);
+    }
+
+    #[test]
+    fn websocket_upgrade_valid_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Upgrade", HeaderValue::from_static("websocket"));
+        headers.insert(
+            "Connection",
+            HeaderValue::from_static("keep-alive, Upgrade"),
+        );
+        headers.insert(
+            "Sec-WebSocket-Key",
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        headers.insert("Sec-WebSocket-Version", HeaderValue::from_static("13"));
+
+        assert!(is_websocket_upgrade(&headers));
+    }
+
+    #[test]
+    fn websocket_upgrade_missing_upgrade_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Connection", HeaderValue::from_static("Upgrade"));
+        headers.insert(
+            "Sec-WebSocket-Key",
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        headers.insert("Sec-WebSocket-Version", HeaderValue::from_static("13"));
+
+        assert!(!is_websocket_upgrade(&headers));
+    }
+
+    #[test]
+    fn websocket_upgrade_invalid_connection_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Upgrade", HeaderValue::from_static("websocket"));
+        headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+        headers.insert(
+            "Sec-WebSocket-Key",
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        headers.insert("Sec-WebSocket-Version", HeaderValue::from_static("13"));
+
+        assert!(!is_websocket_upgrade(&headers));
+    }
+
+    #[test]
+    fn websocket_upgrade_missing_key_or_version() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Upgrade", HeaderValue::from_static("websocket"));
+        headers.insert("Connection", HeaderValue::from_static("Upgrade"));
+
+        // Missing Sec-WebSocket-Key
+        headers.insert("Sec-WebSocket-Version", HeaderValue::from_static("13"));
+        assert!(!is_websocket_upgrade(&headers));
+
+        headers.insert(
+            "Sec-WebSocket-Key",
+            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+        headers.remove("Sec-WebSocket-Version");
+        assert!(!is_websocket_upgrade(&headers));
     }
 }
