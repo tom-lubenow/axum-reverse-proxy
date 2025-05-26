@@ -17,10 +17,13 @@ use tower::balance::p2c::Balance;
 use tower::discover::{Change, Discover};
 use tower::load::CompleteOnResponse;
 use tower::load::{peak_ewma::PeakEwmaDiscover, pending_requests::PendingRequestsDiscover};
-use tower::ServiceExt;
+use tower::util::BoxService;
+use tower::BoxError;
 use tracing::{debug, error, trace, warn};
 
 use crate::proxy::ReverseProxy;
+
+type ProxyService = BoxService<axum::http::Request<Body>, axum::http::Response<Body>, BoxError>;
 
 /// Load balancing strategy for distributing requests across discovered services
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,7 +196,8 @@ where
     counter: Arc<AtomicUsize>,
     discover: D,
     strategy: LoadBalancingStrategy,
-    // No precomputed tower balancer; we create it on demand in `call` for P2C strategies.
+    /// Cached P2C balancer updated when services change
+    p2c_balancer: Arc<tokio::sync::Mutex<Option<ProxyService>>>,
 }
 
 #[cfg(all(feature = "tls", not(feature = "native-tls")))]
@@ -245,7 +249,7 @@ where
             counter: Arc::new(AtomicUsize::new(0)),
             discover: discover.clone(),
             strategy,
-            // We build P2C balancers on demand so we don't store them here.
+            p2c_balancer: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -267,6 +271,8 @@ where
         let proxy_list = Arc::clone(&self.proxy_list);
         let client = self.client.clone();
         let path = self.path.clone();
+        let balancer = Arc::clone(&self.p2c_balancer);
+        let strategy = self.strategy;
 
         tokio::spawn(async move {
             use futures_util::future::poll_fn;
@@ -293,6 +299,13 @@ where
                                 proxies_guard.insert(key.clone(), proxy);
                                 list_guard.push(key);
                             }
+                            if matches!(
+                                strategy,
+                                LoadBalancingStrategy::P2cPendingRequests
+                                    | LoadBalancingStrategy::P2cPeakEwma
+                            ) {
+                                rebuild_p2c_balancer(&proxies, &balancer, strategy).await;
+                            }
                         }
                         Change::Remove(key) => {
                             debug!("Removing service: {:?}", key);
@@ -303,6 +316,13 @@ where
 
                                 proxies_guard.remove(&key);
                                 list_guard.retain(|k| k != &key);
+                            }
+                            if matches!(
+                                strategy,
+                                LoadBalancingStrategy::P2cPendingRequests
+                                    | LoadBalancingStrategy::P2cPeakEwma
+                            ) {
+                                rebuild_p2c_balancer(&proxies, &balancer, strategy).await;
                             }
                         }
                     },
@@ -344,6 +364,7 @@ where
         let proxies = Arc::clone(&self.proxies);
         let proxy_list = Arc::clone(&self.proxy_list);
         let counter = Arc::clone(&self.counter);
+        let balancer = Arc::clone(&self.p2c_balancer);
         let strategy = self.strategy;
 
         Box::pin(async move {
@@ -378,62 +399,78 @@ where
                     }
                 }
                 LoadBalancingStrategy::P2cPendingRequests | LoadBalancingStrategy::P2cPeakEwma => {
-                    // Build a fresh ServiceList discover wrapper over the currently known proxies.
+                    let mut guard = balancer.lock().await;
 
-                    let services_vec: Vec<ReverseProxy<C>> = {
-                        let guard = proxies.read().await;
-                        guard.values().cloned().collect()
-                    };
-
-                    if services_vec.is_empty() {
-                        warn!("No upstream services available for P2C balancer");
-                        return Ok(axum::http::Response::builder()
-                            .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
-                            .body(Body::from("No upstream services available"))
-                            .unwrap());
+                    if guard.is_none() {
+                        drop(guard);
+                        rebuild_p2c_balancer(&proxies, &balancer, strategy).await;
+                        guard = balancer.lock().await;
                     }
 
-                    // Create a ServiceList discover from the set of services.
-                    let discover = tower::discover::ServiceList::new::<axum::http::Request<Body>>(
-                        services_vec,
-                    );
-
-                    // Depending on strategy, wrap the discover with appropriate load metric and forward request.
-                    let result = match strategy {
-                        LoadBalancingStrategy::P2cPendingRequests => {
-                            let wrapped = PendingRequestsDiscover::new(
-                                discover,
-                                CompleteOnResponse::default(),
-                            );
-                            let bal = Balance::new(wrapped);
-                            bal.oneshot(req).await
+                    if let Some(service) = guard.as_mut() {
+                        let fut = service.call(req);
+                        drop(guard);
+                        match fut.await {
+                            Ok(resp) => Ok(resp),
+                            Err(err) => {
+                                error!(?err, "Balancer call failed");
+                                Ok(axum::http::Response::builder()
+                                    .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                                    .body(Body::from("Upstream call failed"))
+                                    .unwrap())
+                            }
                         }
-                        LoadBalancingStrategy::P2cPeakEwma => {
-                            let wrapped = PeakEwmaDiscover::new(
-                                discover,
-                                Duration::from_millis(50),
-                                Duration::from_secs(30),
-                                CompleteOnResponse::default(),
-                            );
-                            let bal = Balance::new(wrapped);
-                            bal.oneshot(req).await
-                        }
-                        _ => unreachable!(),
-                    };
-
-                    match result {
-                        Ok(resp) => Ok(resp),
-                        Err(err) => {
-                            // Tower balance converts errors into BoxError, convert to 503.
-                            error!(?err, "Balancer call failed");
-                            Ok(axum::http::Response::builder()
-                                .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
-                                .body(Body::from("Upstream call failed"))
-                                .unwrap())
-                        }
+                    } else {
+                        warn!("No upstream services available for P2C balancer");
+                        Ok(axum::http::Response::builder()
+                            .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                            .body(Body::from("No upstream services available"))
+                            .unwrap())
                     }
                 }
             }
         })
     }
+}
+
+async fn rebuild_p2c_balancer<C, K>(
+    proxies: &Arc<RwLock<HashMap<K, ReverseProxy<C>>>>,
+    balancer: &Arc<tokio::sync::Mutex<Option<ProxyService>>>,
+    strategy: LoadBalancingStrategy,
+) where
+    C: Connect + Clone + Send + Sync + 'static,
+    K: Clone + Eq + std::hash::Hash + Send + Sync + std::fmt::Debug,
+{
+    let services_vec: Vec<ReverseProxy<C>> = {
+        let guard = proxies.read().await;
+        guard.values().cloned().collect()
+    };
+
+    let mut bal_guard = balancer.lock().await;
+
+    if services_vec.is_empty() {
+        *bal_guard = None;
+        return;
+    }
+
+    let discover = tower::discover::ServiceList::new::<axum::http::Request<Body>>(services_vec);
+
+    let svc = match strategy {
+        LoadBalancingStrategy::P2cPendingRequests => {
+            let wrapped = PendingRequestsDiscover::new(discover, CompleteOnResponse::default());
+            BoxService::new(Balance::new(wrapped))
+        }
+        LoadBalancingStrategy::P2cPeakEwma => {
+            let wrapped = PeakEwmaDiscover::new(
+                discover,
+                Duration::from_millis(50),
+                Duration::from_secs(30),
+                CompleteOnResponse::default(),
+            );
+            BoxService::new(Balance::new(wrapped))
+        }
+        _ => unreachable!(),
+    };
+
+    *bal_guard = Some(svc);
 }
