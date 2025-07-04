@@ -218,7 +218,6 @@
 //! - Timeouts and retries
 //! - Caching
 //! - Compression
-//! - Request buffering (via tower-buffer)
 //!
 //! See the `tower_middleware` example for a complete working example.
 //!
