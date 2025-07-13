@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # Example reverse proxy using axum-reverse-proxy
+  proxy:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - RUST_LOG=axum_reverse_proxy=debug,docker_discovery=info
+    volumes:
+      # Mount Docker socket to allow container discovery
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - api
+      - web
+      - db
+
+  # Example API service
+  api:
+    image: httpbin:latest
+    # No exposed ports needed - proxy will connect via Docker network
+    labels:
+      # Optional: explicitly configure the proxy
+      - "axum-proxy.enable=true"
+      - "axum-proxy.port=80"
+      # - "axum-proxy.path=/custom-api"  # Override the default path
+
+  # Example web service
+  web:
+    image: nginx:alpine
+    volumes:
+      - ./static:/usr/share/nginx/html:ro
+
+  # Example database with admin UI
+  db:
+    image: postgres:latest
+    environment:
+      - POSTGRES_PASSWORD=secret
+    # Database won't be proxied by default (no HTTP service)
+
+  # Another example service
+  whoami:
+    image: traefik/whoami
+    # This will be available at /whoami

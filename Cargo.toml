@@ -1,3 +1,6 @@
+[workspace]
+members = ["."]
+
 [package]
 name = "axum-reverse-proxy"
 version = "1.0.3"
@@ -34,6 +37,7 @@ tracing = "^0.1"
 url = "^2.5"
 hickory-resolver = { version = "0.25.2", optional = true }
 rand = "0.9.1"
+bollard = { version = "0.18", optional = true }
 
 [dev-dependencies]
 async-stream = "^0.3"
@@ -51,15 +55,8 @@ default = ["tls"]
 tls = ["hyper-rustls", "rustls"]
 native-tls = ["hyper-tls", "dep:native-tls", "tokio-native-tls"]
 dns = ["hickory-resolver"]
-full = ["tls", "dns"]
-
-[[bench]]
-name = "proxy_bench"
-harness = false
-
-[[bench]]
-name = "websocket_bench"
-harness = false
+docker = ["bollard"]
+full = ["tls", "dns", "docker"]
 
 [[example]]
 name = "basic"
@@ -105,3 +102,13 @@ required-features = ["tls", "dns"]
 name = "dangerous_client"
 path = "examples/dangerous_client.rs"
 required-features = ["tls"]
+
+[[example]]
+name = "docker_discovery"
+path = "examples/docker_discovery.rs"
+required-features = ["docker"]
+
+[[example]]
+name = "docker_discovery_advanced"
+path = "examples/docker_discovery_advanced.rs"
+required-features = ["docker"]

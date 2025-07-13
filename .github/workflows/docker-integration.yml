@@ -1,0 +1,72 @@
+name: Docker Integration Tests
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/docker_*.rs'
+      - 'tests/docker-integration/**'
+      - '.github/workflows/docker-integration.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/docker_*.rs'
+      - 'tests/docker-integration/**'
+      - '.github/workflows/docker-integration.yml'
+
+jobs:
+  docker-compose-tests:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Run Docker Compose tests
+      run: |
+        cd tests/docker-integration
+        ./run-compose-tests.sh
+    
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: compose-test-results
+        path: tests/docker-integration/test-results/
+
+  docker-swarm-tests:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Run Docker Swarm tests
+      run: |
+        cd tests/docker-integration
+        ./run-swarm-tests.sh
+    
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: swarm-test-results
+        path: tests/docker-integration/test-results/
+
+  integration-test-summary:
+    needs: [docker-compose-tests, docker-swarm-tests]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Check test results
+      run: |
+        if [ "${{ needs.docker-compose-tests.result }}" != "success" ] || [ "${{ needs.docker-swarm-tests.result }}" != "success" ]; then
+          echo "Integration tests failed"
+          exit 1
+        fi
+        echo "All integration tests passed!"

@@ -20,6 +20,8 @@ The eventual goal would be to benchmark ourselves against common reverse proxy l
 - 🔒 HTTPS support
 - 📋 Optional RFC9110 compliance layer
 - 🔧 Full Tower middleware support
+- 🌐 DNS-based service discovery (requires `dns` feature)
+- 🐳 Docker container discovery with real-time updates (requires `docker` feature)
 
 ## Installation
 
@@ -31,7 +33,8 @@ This crate comes with a couple of optional features:
 
 - `tls` – enables HTTPS support via `hyper-rustls` (this is on by default)
 - `dns` – enables DNS-based service discovery
-- `full` – enables all features (`tls` and `dns`)
+- `docker` – enables Docker container discovery
+- `full` – enables all features (`tls`, `dns`, and `docker`)
 
 To enable features explicitly in `Cargo.toml`:
 
@@ -87,6 +90,75 @@ proxy.start_discovery().await;
 let app: Router = Router::new().nest_service("/", proxy);
 ```
 
+### Docker Discovery
+
+The `docker` feature enables automatic service discovery for Docker containers, perfect for containerized environments. It provides real-time updates when containers start/stop, unlike DNS polling.
+
+#### Quick Start - Proxy Everything
+
+```rust
+use axum::Router;
+use axum_reverse_proxy::{DockerRouter, DockerRouterExt};
+use hyper_util::client::legacy::Client;
+
+// Create HTTP client
+let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
+
+// Discover all running containers automatically
+let docker_router = DockerRouter::everything(client).await?;
+
+// Services are available at /{container_name}
+let app = Router::new()
+    .docker_proxy(docker_router);
+```
+
+#### Configuration Options
+
+```rust
+// 1. Only proxy labeled containers
+let discovery = DockerDiscovery::labeled("proxy.enable=true").await?;
+
+// 2. Custom configuration
+let discovery = DockerDiscovery::builder()
+    .label_prefix("myapp")                          // Use custom label prefix
+    .network("my-network")                          // Only containers on this network
+    .port_detection(PortDetectionStrategy::FromLabel("port"))
+    .strip_prefix("myproject_")                     // Remove compose project prefix
+    .build().await?;
+
+// 3. Create router with custom load balancing
+let docker_router = DockerRouter::new(client, discovery)
+    .await?
+    .with_strategy(LoadBalancingStrategy::P2cPendingRequests);
+```
+
+#### Container Configuration
+
+Configure containers using labels:
+
+```yaml
+# docker-compose.yml
+services:
+  api:
+    image: myapi:latest
+    labels:
+      - "axum-proxy.enable=true"      # Enable discovery (optional with .everything())
+      - "axum-proxy.port=8080"        # Specify port (auto-detected if not set)
+      - "axum-proxy.path=/custom-api" # Override path (default: /api)
+```
+
+#### Features
+
+- **Real-time Updates**: Responds instantly to container lifecycle events
+- **Automatic Port Detection**: Intelligently selects exposed ports
+- **Service Name Routing**: Uses Docker Compose service names by default
+- **Flexible Filtering**: Filter by labels, networks, or both
+- **Load Balancing**: Supports all standard load balancing strategies
+
+#### Requirements
+
+- Mount Docker socket: `-v /var/run/docker.sock:/var/run/docker.sock:ro`
+- Enable feature: `axum-reverse-proxy = { version = "*", features = ["docker"] }`
 
 ## Advanced Usage
 

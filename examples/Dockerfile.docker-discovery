@@ -1,0 +1,27 @@
+# Example Dockerfile for running the Docker discovery example
+FROM rust:1.75 as builder
+
+WORKDIR /app
+
+# Copy manifests
+COPY Cargo.toml Cargo.lock ./
+
+# Copy source code
+COPY src ./src
+COPY examples ./examples
+
+# Build the example with Docker feature
+RUN cargo build --release --example docker_discovery --features docker
+
+# Runtime image
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/examples/docker_discovery /usr/local/bin/proxy
+
+EXPOSE 3000
+
+CMD ["proxy"]

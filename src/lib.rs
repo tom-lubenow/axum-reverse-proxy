@@ -306,6 +306,10 @@ mod balanced_proxy;
 mod danger;
 #[cfg(feature = "dns")]
 mod dns_discovery;
+#[cfg(feature = "docker")]
+mod docker_discovery;
+#[cfg(feature = "docker")]
+mod docker_router;
 mod proxy;
 mod retry;
 mod rfc9110;
@@ -323,6 +327,10 @@ pub use danger::create_dangerous_native_tls_connector;
 pub use danger::create_dangerous_rustls_config;
 #[cfg(feature = "dns")]
 pub use dns_discovery::{DnsDiscovery, DnsDiscoveryConfig, StaticDnsDiscovery};
+#[cfg(feature = "docker")]
+pub use docker_discovery::{DockerDiscovery, DockerDiscoveryConfig, PortDetectionStrategy};
+#[cfg(feature = "docker")]
+pub use docker_router::{DockerRouter, DockerRouterExt};
 pub use proxy::ReverseProxy;
 pub use retry::RetryLayer;
 pub use rfc9110::{Rfc9110Config, Rfc9110Layer};
