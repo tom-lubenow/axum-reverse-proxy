@@ -224,23 +224,30 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
     }
 
     /// Transform an incoming request path into the target URI
-    fn transform_uri(&self, path: &str) -> String {
+    fn transform_uri(&self, path_and_query: &str) -> String {
+        let (path, query) = path_and_query.split_once('?').map(|(p,q)| (p, Some(q))).unwrap_or((path_and_query, None));
+
         let target = self.target.trim_end_matches('/');
         let base_path = self.path.trim_end_matches('/');
 
         let remaining = if path == "/" && !self.path.is_empty() {
             ""
-        } else if path.starts_with("/?") && !self.target.ends_with('/') {
-            path.strip_prefix('/').unwrap()
         } else if let Some(stripped) = path.strip_prefix(base_path) {
             stripped
         } else {
             path
         };
 
-        let mut uri = String::with_capacity(target.len() + remaining.len());
+        let mut uri = String::with_capacity(target.len() + remaining.len() + query.map_or(0, |q| 1 + q.len()));
         uri.push_str(target);
         uri.push_str(remaining);
+        if let Some(query) = query {
+            if !uri.ends_with('/') && self.target.ends_with('/') && ( remaining.is_empty() || path_and_query.find("/?").is_some_and(|i| i > 0)) {
+                uri.push('/');
+            }
+            uri.push('?');
+            uri.push_str(query);
+        }
         uri
     }
 }
@@ -304,24 +311,56 @@ mod tests {
             "http://target/test?query=test"
         );
 
-        let proxy_no_slash = ReverseProxy::new("/", "http://target/api");
+        let proxy_root_no_slash = ReverseProxy::new("/", "http://target/api");
+        assert_eq!(
+            proxy_root_no_slash.transform_uri("/test?query=test"),
+            "http://target/api/test?query=test"
+        );
+        assert_eq!(
+            proxy_root_no_slash.transform_uri("?query=test"),
+            "http://target/api?query=test"
+        );
+
+        let proxy_root_slash = ReverseProxy::new("/", "http://target/api/");
+        assert_eq!(
+            proxy_root_slash.transform_uri("/test?query=test"),
+            "http://target/api/test?query=test"
+        );
+        assert_eq!(
+            proxy_root_slash.transform_uri("?query=test"),
+            "http://target/api/?query=test"
+        );
+        
+        let proxy_no_slash = ReverseProxy::new("/test", "http://target/api");
         assert_eq!(
             proxy_no_slash.transform_uri("/test?query=test"),
-            "http://target/api/test?query=test"
+            "http://target/api?query=test"
+        );
+        assert_eq!(
+            proxy_no_slash.transform_uri("/test/?query=test"),
+            "http://target/api/?query=test"
         );
         assert_eq!(
             proxy_no_slash.transform_uri("?query=test"),
             "http://target/api?query=test"
         );
 
-        let proxy_slash = ReverseProxy::new("/", "http://target/api/");
+        let proxy_root_slash = ReverseProxy::new("/test", "http://target/api/");
         assert_eq!(
-            proxy_slash.transform_uri("/test?query=test"),
-            "http://target/api/test?query=test"
+            proxy_root_slash.transform_uri("/test?query=test"),
+            "http://target/api/?query=test"
         );
         assert_eq!(
-            proxy_slash.transform_uri("?query=test"),
-            "http://target/api?query=test"
+            proxy_root_slash.transform_uri("/test/?query=test"),
+            "http://target/api/?query=test"
+        );
+        assert_eq!(
+            proxy_root_slash.transform_uri("/something"),
+            "http://target/api/something"
+        );
+        assert_eq!(
+            proxy_root_slash.transform_uri("/test/something"),
+            "http://target/api/something"
         );
     }
 
