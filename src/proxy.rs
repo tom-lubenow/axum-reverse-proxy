@@ -230,6 +230,8 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
 
         let remaining = if path == "/" && !self.path.is_empty() {
             ""
+        } else if path.starts_with("/?") && !self.target.ends_with('/') {
+            path.strip_prefix('/').unwrap()
         } else if let Some(stripped) = path.strip_prefix(base_path) {
             stripped
         } else {
@@ -270,6 +272,7 @@ where
 
 #[cfg(test)]
 mod tests {
+
     use super::StandardReverseProxy as ReverseProxy;
 
     #[test]
@@ -281,6 +284,44 @@ mod tests {
         assert_eq!(
             proxy_no_slash.transform_uri("/api/test"),
             "http://target/test"
+        );
+    }
+
+    #[test]
+    fn transform_uri_with_query() {
+        let proxy_root = ReverseProxy::new("/", "http://target");
+
+        assert_eq!(
+            proxy_root.transform_uri("?query=test"),
+            "http://target?query=test"
+        );
+        assert_eq!(
+            proxy_root.transform_uri("/?query=test"),
+            "http://target?query=test"
+        );
+        assert_eq!(
+            proxy_root.transform_uri("/test?query=test"),
+            "http://target/test?query=test"
+        );
+
+        let proxy_no_slash = ReverseProxy::new("/", "http://target/api");
+        assert_eq!(
+            proxy_no_slash.transform_uri("/test?query=test"),
+            "http://target/api/test?query=test"
+        );
+        assert_eq!(
+            proxy_no_slash.transform_uri("?query=test"),
+            "http://target/api?query=test"
+        );
+
+        let proxy_slash = ReverseProxy::new("/", "http://target/api/");
+        assert_eq!(
+            proxy_slash.transform_uri("/test?query=test"),
+            "http://target/api/test?query=test"
+        );
+        assert_eq!(
+            proxy_slash.transform_uri("?query=test"),
+            "http://target/api?query=test"
         );
     }
 
