@@ -412,3 +412,347 @@ async fn test_proxy_query_parameters() {
     proxy_server.abort();
     test_server.abort();
 }
+
+#[tokio::test]
+async fn test_no_extra_slash_for_empty_path_with_query() {
+    // Upstream echoes the exact path it sees
+    let echo_handler = get(|req: Request<Body>| async move {
+        let path = req.uri().path().to_string();
+        Json(json!({ "received_path": path }))
+    });
+    let upstream = Router::new().route("/{*path}", echo_handler.clone()).route("/", echo_handler);
+
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_server = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream).await.unwrap();
+    });
+
+    // Reverse proxy configured on a non-root path, targeting a sub-path on the upstream
+    let proxy = ReverseProxy::new("/proxy", &format!("http://{upstream_addr}/api"));
+    let app: Router = proxy.into();
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_server = tokio::spawn(async move {
+        axum::serve(proxy_listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // When requesting /proxy?foo=bar, upstream must see /api (not /api/)
+    let response = client
+        .get(format!("http://{proxy_addr}/proxy?foo=bar"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["received_path"], "/api");
+
+    // Cleanup
+    proxy_server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn test_only_prefixed_paths_are_proxied() {
+    // Create a simple upstream
+    let upstream = Router::new().route("/ok", get(|| async { "OK" }));
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_server = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream).await.unwrap();
+    });
+
+    // Reverse proxy mounted at /api
+    let proxy = ReverseProxy::new("/api", &format!("http://{upstream_addr}"));
+    let app: Router = proxy.into();
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_server = tokio::spawn(async move {
+        axum::serve(proxy_listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // Non-prefixed path should NOT be proxied and should 404
+    let resp = client
+        .get(format!("http://{proxy_addr}/ok"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+
+    // Prefixed path should be proxied
+    let resp = client
+        .get(format!("http://{proxy_addr}/api/ok"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.text().await.unwrap(), "OK");
+
+    // Cleanup
+    proxy_server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn test_similar_prefix_is_not_stripped() {
+    // Upstream echoes received path
+    let echo_handler = get(|req: Request<Body>| async move {
+        let path = req.uri().path();
+        Json(json!({ "received_path": path }))
+    });
+    let upstream = Router::new().route("/{*path}", echo_handler.clone()).route("/", echo_handler);
+
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_server = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream).await.unwrap();
+    });
+
+    // Use the proxy directly as a fallback service (not nested),
+    // so transform_uri may attempt to strip the configured base.
+    let proxy = ReverseProxy::new("/api", &format!("http://{upstream_addr}"));
+    let app = Router::new().fallback_service(proxy);
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_server = tokio::spawn(async move {
+        axum::serve(proxy_listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // Path begins with '/api' but is not the '/api' prefix; must not be stripped.
+    let response = client
+        .get(format!("http://{proxy_addr}/apiary"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["received_path"], "/apiary");
+
+    // '/apiX/foo' also should not be stripped.
+    let response = client
+        .get(format!("http://{proxy_addr}/apix/foo"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["received_path"], "/apix/foo");
+
+    proxy_server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn test_root_base_query_only_no_slash() {
+    // Upstream echoes the exact path
+    let echo_handler = get(|req: Request<Body>| async move {
+        Json(json!({ "received_path": req.uri().path() }))
+    });
+    let upstream = Router::new().route("/{*path}", echo_handler.clone()).route("/", echo_handler);
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_server = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream).await.unwrap();
+    });
+
+    // Base path is '/', target has a sub-path.
+    let proxy = ReverseProxy::new("/", &format!("http://{upstream_addr}/api"));
+    let app: Router = proxy.into();
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_server = tokio::spawn(async move {
+        axum::serve(proxy_listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // '/?q=1' at root should resolve to '/api' (no trailing slash) at upstream
+    let response = client
+        .get(format!("http://{proxy_addr}/?q=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["received_path"], "/api");
+
+    proxy_server.abort();
+    upstream_server.abort();
+}
+
+// NOTE: Dot-segment normalization is left to underlying stacks. We intentionally
+// do not assert preservation here because different layers may canonicalize.
+
+#[tokio::test]
+async fn test_encoded_boundary_stripping() {
+    // Upstream echoes the path
+    let echo_handler = get(|req: Request<Body>| async move {
+        Json(json!({ "received_path": req.uri().path() }))
+    });
+    let upstream = Router::new().route("/{*path}", echo_handler.clone()).route("/", echo_handler);
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_server = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream).await.unwrap();
+    });
+
+    // Use fallback service so boundary-aware stripping logic is exercised
+    let proxy = ReverseProxy::new("/foo%20bar", &format!("http://{upstream_addr}"));
+    let app = Router::new().fallback_service(proxy);
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_server = tokio::spawn(async move {
+        axum::serve(proxy_listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // Exact match should strip
+    let res = client
+        .get(format!("http://{proxy_addr}/foo%20bar"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["received_path"], "/");
+
+    // Boundary with slash should strip
+    let res = client
+        .get(format!("http://{proxy_addr}/foo%20bar/baz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["received_path"], "/baz");
+
+    // Similar prefix without boundary must NOT strip
+    let res = client
+        .get(format!("http://{proxy_addr}/foo%20barista"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["received_path"], "/foo%20barista");
+
+    proxy_server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn test_root_base_matrix() {
+    // Upstream echoes the path
+    let echo_handler = get(|req: Request<Body>| async move {
+        Json(json!({ "received_path": req.uri().path() }))
+    });
+    let upstream = Router::new().route("/{*path}", echo_handler.clone()).route("/", echo_handler);
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_server = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream).await.unwrap();
+    });
+
+    // Base '/'; target '/api'
+    let proxy = ReverseProxy::new("/", &format!("http://{upstream_addr}/api"));
+    let app: Router = proxy.into();
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_server = tokio::spawn(async move {
+        axum::serve(proxy_listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    let cases = [
+        ("/", "/api"),
+        ("/x", "/api/x"),
+        ("/x/", "/api/x/"),
+    ];
+    for (req_path, expected) in cases {
+        let res = client
+            .get(format!("http://{proxy_addr}{req_path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["received_path"], expected);
+    }
+
+    proxy_server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn test_methods_preserve_join() {
+    use http::Method;
+
+    let echo_handler = |method: Method, req: Request<Body>| async move {
+        Json(json!({ "m": method.as_str(), "p": req.uri().path() }))
+    };
+
+    let upstream = Router::new()
+        .route("/{*path}", get(echo_handler.clone()).post(echo_handler.clone()).put(echo_handler.clone()).delete(echo_handler.clone()))
+        .route("/", get(echo_handler.clone()).post(echo_handler.clone()).put(echo_handler.clone()).delete(echo_handler));
+
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_server = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream).await.unwrap();
+    });
+
+    let proxy = ReverseProxy::new("/api", &format!("http://{upstream_addr}/tgt"));
+    let app: Router = proxy.into();
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_server = tokio::spawn(async move {
+        axum::serve(proxy_listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // GET
+    let r = client.get(format!("http://{proxy_addr}/api/x")).send().await.unwrap();
+    let b: Value = r.json().await.unwrap();
+    assert_eq!(b["m"], "GET");
+    assert_eq!(b["p"], "/tgt/x");
+
+    // POST
+    let r = client.post(format!("http://{proxy_addr}/api/x")).body("hi").send().await.unwrap();
+    let b: Value = r.json().await.unwrap();
+    assert_eq!(b["m"], "POST");
+    assert_eq!(b["p"], "/tgt/x");
+
+    // PUT
+    let r = client.put(format!("http://{proxy_addr}/api/x/"))
+        .body("hi")
+        .send().await.unwrap();
+    let b: Value = r.json().await.unwrap();
+    assert_eq!(b["m"], "PUT");
+    assert_eq!(b["p"], "/tgt/x/");
+
+    // DELETE
+    let r = client.delete(format!("http://{proxy_addr}/api?flag=1"))
+        .send().await.unwrap();
+    let b: Value = r.json().await.unwrap();
+    assert_eq!(b["m"], "DELETE");
+    assert_eq!(b["p"], "/tgt");
+
+    proxy_server.abort();
+    upstream_server.abort();
+}

@@ -1,5 +1,6 @@
 use axum::body::Body;
-use http::StatusCode;
+use http::{StatusCode, Uri};
+use http::uri::Builder as UriBuilder;
 use http_body_util::BodyExt;
 #[cfg(all(feature = "tls", not(feature = "native-tls")))]
 use hyper_rustls::HttpsConnector;
@@ -154,7 +155,14 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
         // Check if this is a WebSocket upgrade request
         if websocket::is_websocket_upgrade(req.headers()) {
             trace!("Detected WebSocket upgrade request");
-            match websocket::handle_websocket(req, &self.target).await {
+            // Build the upstream HTTP URI first, then let WS code map scheme
+            let path_q = req
+                .uri()
+                .path_and_query()
+                .map(|x| x.as_str())
+                .unwrap_or("");
+            let upstream_http_uri = self.transform_uri(path_q);
+            match websocket::handle_websocket_with_upstream_uri(req, upstream_http_uri).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     error!("Failed to handle WebSocket upgrade: {}", e);
@@ -167,12 +175,17 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
         }
 
         let forward_req = {
+            let path_q = req
+                .uri()
+                .path_and_query()
+                .map(|x| x.as_str())
+                .unwrap_or("");
+            let upstream_uri = self.transform_uri(path_q);
+
             let mut builder =
                 axum::http::Request::builder()
                     .method(req.method().clone())
-                    .uri(self.transform_uri(
-                        req.uri().path_and_query().map(|x| x.as_str()).unwrap_or(""),
-                    ));
+                    .uri(upstream_uri.clone());
 
             // Forward headers
             for (key, value) in req.headers() {
@@ -223,23 +236,91 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
         }
     }
 
-    /// Transform an incoming request path into the target URI
-    fn transform_uri(&self, path: &str) -> String {
-        let target = self.target.trim_end_matches('/');
+    /// Transform an incoming request path+query into the target URI using http::Uri builder
+    ///
+    /// Rules:
+    /// - Trim target trailing slash for joining
+    /// - Strip proxy base path at a boundary (exact or followed by '/')
+    /// - If remainder is exactly '/' under a non-empty base, treat as empty
+    /// - Do not add a slash for query-only joins (avoid target '/?')
+    fn transform_uri(&self, path_and_query: &str) -> Uri {
         let base_path = self.path.trim_end_matches('/');
 
-        let remaining = if path == "/" && !self.path.is_empty() {
-            ""
-        } else if let Some(stripped) = path.strip_prefix(base_path) {
-            stripped
-        } else {
-            path
+        // Parse target URI
+        let target_uri: Uri = self
+            .target
+            .parse()
+            .expect("ReverseProxy target must be a valid URI");
+
+        let scheme = target_uri
+            .scheme_str()
+            .unwrap_or("http");
+        let authority = target_uri
+            .authority()
+            .expect("ReverseProxy target must include authority (host)")
+            .as_str()
+            .to_string();
+
+        // Normalize target base path: drop trailing slash and treat "/" as empty
+        let target_base_path = {
+            let p = target_uri.path();
+            if p == "/" { "" } else { p.trim_end_matches('/') }
         };
 
-        let mut uri = String::with_capacity(target.len() + remaining.len());
-        uri.push_str(target);
-        uri.push_str(remaining);
-        uri
+        // Split incoming path and query
+        let (path_part, query_part) = match path_and_query.find('?') {
+            Some(i) => (&path_and_query[..i], Some(&path_and_query[i + 1..])),
+            None => (path_and_query, None),
+        };
+
+        // Compute remainder after stripping base when applicable
+        let remaining_path = if path_part == "/" && !self.path.is_empty() {
+            ""
+        } else if !base_path.is_empty() && path_part.starts_with(base_path) {
+            let rem = &path_part[base_path.len()..];
+            if rem.is_empty() || rem.starts_with('/') { rem } else { path_part }
+        } else {
+            path_part
+        };
+
+        // Join target base path with remainder
+        let joined_path = if remaining_path.is_empty() {
+            if target_base_path.is_empty() { "/" } else { target_base_path }
+        } else {
+            // remaining_path starts with '/'; concatenate without duplicating slash
+            if target_base_path.is_empty() { remaining_path } else { 
+                // allocate a small string to join
+                // SAFETY: both parts are valid path slices
+                // Build into a String for path_and_query
+                // We will rebuild below
+                // Placeholder; real joining below
+                "__JOIN__"
+            }
+        };
+
+        // Build final path_and_query string explicitly to keep exact bytes
+        let final_path = if joined_path == "__JOIN__" {
+            let mut s = String::with_capacity(target_base_path.len() + remaining_path.len());
+            s.push_str(target_base_path);
+            s.push_str(remaining_path);
+            s
+        } else {
+            joined_path.to_string()
+        };
+
+        let mut path_and_query_buf = final_path;
+        if let Some(q) = query_part {
+            path_and_query_buf.push('?');
+            path_and_query_buf.push_str(q);
+        }
+
+        // Build the full URI
+        UriBuilder::new()
+            .scheme(scheme)
+            .authority(authority.as_str())
+            .path_and_query(path_and_query_buf.as_str())
+            .build()
+            .expect("Failed to build upstream URI")
     }
 }
 

@@ -119,6 +119,22 @@ let app: Router = proxy.into();
 let app = app.layer(ServiceBuilder::new().layer(BufferLayer::new(100)));
 ```
 
+### Path Transform Semantics
+
+This crate follows clear rules for joining the incoming request path with the configured base path and the upstream target:
+
+- Base terms: `B` = configured base path, `T` = upstream target (may include a path), `P?Q` = incoming path+query.
+- Trim target trailing slash: treat `T` with no trailing `/` for joining; if `T` has no path, it is treated as empty (`/` is used when necessary for URI validity).
+- Boundary-aware base stripping: strip `B` only when `P` is exactly `B` or starts with `B/`. Never strip similar prefixes (e.g., `B=/api` doesn’t strip `/apiary`).
+- Nested vs fallback: when mounted via `Router::nest(B, ...)`, Axum already strips `B` before your service sees the request. The proxy detects this and handles both mounting styles consistently.
+- Empty remainder: if the remainder is effectively empty (e.g., `P` is `/` under a non-empty `B`), the proxy does not insert an extra slash before a query string. Example: `/base?x=1` → `T?x=1` (not `T/?x=1`).
+- Join: append the remainder to `T`’s path verbatim; do not re-encode segments; preserve case and interior slashes.
+- Query: append `?Q` exactly as received; the presence of a query does not force a `/` when the remainder is empty.
+- Dot-segments: normalization is left to underlying HTTP stacks; the proxy does not add its own normalization.
+- WebSocket: the same path+query join logic applies; schemes are mapped `http→ws` and `https→wss`.
+
+These rules are enforced by a single code path that builds the upstream URI using `http::Uri` to avoid stringly-typed errors. See tests under `tests/routing.rs` and `tests/websocket.rs` for coverage of edge cases (queries, trailing slashes, boundary stripping, mount vs fallback, and WebSocket parity).
+
 ### Merging with Existing Router
 
 You can merge the proxy with your existing Axum router:

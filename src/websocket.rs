@@ -1,4 +1,4 @@
-use axum::{body::Body, http::Request, response::Response};
+use axum::{body::Body, http::{Request, Response, Uri}};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, stream::StreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -82,9 +82,9 @@ pub(crate) fn compute_host_header(url: &str) -> (String, u16) {
 ///
 /// This function follows the WebSocket protocol specification (RFC 6455) for the upgrade handshake.
 /// It ensures that all required headers are properly handled and forwarded to the upstream server.
-pub(crate) async fn handle_websocket(
+pub(crate) async fn handle_websocket_with_upstream_uri(
     req: Request<Body>,
-    target: &str,
+    upstream_http_uri: Uri,
 ) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
     trace!("Handling WebSocket upgrade request");
 
@@ -101,22 +101,26 @@ pub(crate) async fn handle_websocket(
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     let ws_accept = STANDARD.encode(hasher.finalize());
 
-    // Get the path and query from the request
-    let path_and_query = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("");
-
-    trace!("Original path: {}", path_and_query);
-
-    // Convert the target URL to WebSocket URL
-    let upstream_url = if target.starts_with("ws://") || target.starts_with("wss://") {
-        format!("{target}{path_and_query}")
-    } else {
-        let (scheme, rest) = if target.starts_with("https://") {
-            ("wss://", target.trim_start_matches("https://"))
-        } else {
-            ("ws://", target.trim_start_matches("http://"))
-        };
-        format!("{}{}{}", scheme, rest.trim_end_matches('/'), path_and_query)
+    // Build a ws:// or wss:// URL from the provided upstream HTTP URI (which already
+    // has correct path+query joining applied)
+    let scheme = upstream_http_uri
+        .scheme_str()
+        .unwrap_or("http");
+    let ws_scheme = match scheme {
+        "wss" | "ws" => scheme,
+        "https" => "wss",
+        _ => "ws",
     };
+
+    let authority = upstream_http_uri
+        .authority()
+        .ok_or("Upstream URI missing authority")?
+        .as_str();
+    let path_q = upstream_http_uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let upstream_url = format!("{}://{}{}", ws_scheme, authority, path_q);
 
     trace!("Connecting to upstream WebSocket at {}", upstream_url);
 

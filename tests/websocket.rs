@@ -1,6 +1,7 @@
 use axum::{
     Router,
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
+    http::Uri,
     response::IntoResponse,
     routing::get,
 };
@@ -41,6 +42,11 @@ async fn handle_socket(mut socket: WebSocket) {
             break;
         }
     }
+}
+
+async fn websocket_handler_with_path(ws: WebSocketUpgrade, uri: Uri, State(tx): State<tokio::sync::mpsc::Sender<String>>) -> impl IntoResponse {
+    let _ = tx.send(uri.path().to_string()).await;
+    ws.on_upgrade(handle_socket)
 }
 
 async fn setup_test_server(target_prefix: &str) -> (SocketAddr, SocketAddr) {
@@ -112,6 +118,55 @@ async fn test_websocket_echo() {
     } else {
         panic!("Did not receive response");
     }
+}
+
+#[tokio::test]
+async fn test_websocket_path_query_join_parity() {
+    use tokio::sync::mpsc;
+
+    // Upstream echoes path via channel on upgrade
+    let (tx, mut rx) = mpsc::channel::<String>(1);
+    let app = Router::new().route("/api/ws", get(websocket_handler_with_path)).with_state(tx);
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(upstream_listener, app).await.unwrap(); });
+
+    // Mount mode
+    let mount_proxy = ReverseProxy::new("/base", &format!("http://{upstream_addr}/api"));
+    let mount_app: Router = mount_proxy.into();
+    let mount_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mount_addr = mount_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mount_listener, mount_app).await.unwrap(); });
+
+    // Connect via proxy with query-only remainder
+    let url = format!("ws://127.0.0.1:{}/base/ws?foo=bar", mount_addr.port());
+    let (_ws, _) = tokio_tungstenite::connect_async(&url).await.expect("ws connect via mount");
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("no path received")
+        .expect("channel closed");
+    assert_eq!(seen, "/api/ws");
+
+    // Fallback mode
+    let (tx2, mut rx2) = mpsc::channel::<String>(1);
+    let app2 = Router::new().route("/api/ws", get(websocket_handler_with_path)).with_state(tx2.clone());
+    let upstream_listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr2 = upstream_listener2.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(upstream_listener2, app2).await.unwrap(); });
+
+    let fb_proxy = ReverseProxy::new("/base", &format!("http://{upstream_addr2}/api"));
+    let fb_app = Router::new().fallback_service(fb_proxy);
+    let fb_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fb_addr = fb_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(fb_listener, fb_app).await.unwrap(); });
+
+    let url2 = format!("ws://127.0.0.1:{}/base/ws?x=y", fb_addr.port());
+    let (_ws2, _) = tokio_tungstenite::connect_async(&url2).await.expect("ws connect via fallback");
+    let seen2 = tokio::time::timeout(std::time::Duration::from_secs(2), rx2.recv())
+        .await
+        .expect("no path received")
+        .expect("channel closed");
+    assert_eq!(seen2, "/api/ws");
 }
 
 #[tokio::test]
