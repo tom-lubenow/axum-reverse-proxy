@@ -20,7 +20,7 @@ http = "^1.0"
 http-body-util = "^0.1"
 http-body = "^1.0"
 hyper = { version = "^1.0", features = ["full"] }
-hyper-rustls = { version = "^0.27", optional = true }
+hyper-rustls = { version = "^0.27", optional = true, features = ["webpki-roots"] }
 hyper-tls = { version = "^0.6", optional = true }
 hyper-util = { version = "^0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 native-tls = { version = "^0.2", optional = true }
