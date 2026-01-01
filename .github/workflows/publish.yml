@@ -15,23 +15,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-      
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
       - name: Check package version
         if: github.event_name == 'release'
         run: |
-          VERSION=$(cargo metadata --format-version=1 | jq -r '.packages[] | select(.name == "axum-reverse-proxy") | .version')
+          VERSION=$(nix develop --command cargo metadata --format-version=1 | jq -r '.packages[] | select(.name == "axum-reverse-proxy") | .version')
           TAG=${GITHUB_REF#refs/tags/}
           if [ "v$VERSION" != "$TAG" ]; then
             echo "Package version ($VERSION) does not match release tag ($TAG)"
             exit 1
           fi
-      
+
       - name: Verify Cargo.toml
         run: |
           if ! grep -q 'license = "MIT"' Cargo.toml; then
@@ -46,23 +43,23 @@ jobs:
             echo "Repository must be specified in Cargo.toml"
             exit 1
           fi
-      
+
       - name: Run tests
-        run: cargo test --features full
-      
+        run: nix develop --command cargo test --features full
+
       - name: Run doc tests
-        run: cargo test --doc
-      
+        run: nix develop --command cargo test --doc
+
       - name: Check formatting
-        run: cargo fmt --all -- --check
-      
+        run: nix develop --command cargo fmt --all -- --check
+
       - name: Run clippy
-        run: cargo clippy --features full -- -D warnings
-      
+        run: nix develop --command cargo clippy --features full -- -D warnings
+
       - name: Publish dry run
-        run: cargo publish --dry-run
-      
+        run: nix develop --command cargo publish --dry-run
+
       - name: Publish to crates.io
-        run: cargo publish --no-verify
+        run: nix develop --command cargo publish --no-verify
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }} 
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
