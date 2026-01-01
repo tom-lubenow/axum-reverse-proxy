@@ -133,6 +133,11 @@ pub struct Rfc9110Config {
     pub pseudonym: Option<String>,
     /// Whether to combine Via headers with the same protocol version
     pub combine_via: bool,
+    /// Whether to preserve WebSocket upgrade headers (Connection, Upgrade)
+    /// When true, the layer will detect WebSocket upgrade requests and preserve
+    /// the hop-by-hop headers needed for the upgrade to work.
+    /// Default: true
+    pub preserve_websocket_headers: bool,
 }
 
 impl Default for Rfc9110Config {
@@ -141,6 +146,7 @@ impl Default for Rfc9110Config {
             server_names: None,
             pseudonym: None,
             combine_via: true,
+            preserve_websocket_headers: true,
         }
     }
 }
@@ -228,8 +234,12 @@ where
             // Save the Max-Forwards value after processing
             let max_forwards = request.headers().get(http::header::MAX_FORWARDS).cloned();
 
+            // Detect WebSocket upgrade request to preserve necessary headers
+            let is_websocket = config.preserve_websocket_headers
+                && is_websocket_upgrade_request(&request);
+
             // 3. Process Connection header and remove hop-by-hop headers
-            process_connection_header(&mut request);
+            process_connection_header(&mut request, is_websocket);
 
             // Save end-to-end headers after processing Connection header
             let preserved_headers = request.headers().clone();
@@ -240,8 +250,10 @@ where
             // 5. Forward the request
             let mut response = inner.call(request).await?;
 
-            // 6. Process response headers
-            process_response_headers(&mut response);
+            // 6. Process response headers (preserve WebSocket headers for 101 responses too)
+            let is_websocket_response = is_websocket
+                && response.status() == StatusCode::SWITCHING_PROTOCOLS;
+            process_response_headers(&mut response, is_websocket_response);
 
             // 7. Add Via header to response (use the same one we set in the request)
             if let Some(via) = via_header {
@@ -283,30 +295,29 @@ where
 /// Detect request loops based on Via headers and server names
 fn detect_loop(request: &Request<Body>, config: &Rfc9110Config) -> Option<Response<Body>> {
     // 1. Check if the target host matches any of our server names
-    if let Some(server_names) = &config.server_names {
-        if let Some(host) = request.uri().host() {
-            if server_names.contains(host) {
-                let mut response = Response::new(Body::empty());
-                *response.status_mut() = StatusCode::LOOP_DETECTED;
-                return Some(response);
-            }
-        }
+    if let Some(server_names) = &config.server_names
+        && let Some(host) = request.uri().host()
+        && server_names.contains(host)
+    {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::LOOP_DETECTED;
+        return Some(response);
     }
 
     // 2. Check for loops in Via headers
-    if let Some(via) = request.headers().get(http::header::VIA) {
-        if let Ok(via_str) = via.to_str() {
-            let pseudonym = config.pseudonym.as_deref().unwrap_or("proxy");
-            let via_entries: Vec<&str> = via_str.split(',').map(str::trim).collect();
+    if let Some(via) = request.headers().get(http::header::VIA)
+        && let Ok(via_str) = via.to_str()
+    {
+        let pseudonym = config.pseudonym.as_deref().unwrap_or("proxy");
+        let via_entries: Vec<&str> = via_str.split(',').map(str::trim).collect();
 
-            // Check if our pseudonym appears in any Via header
-            for entry in via_entries {
-                let parts: Vec<&str> = entry.split_whitespace().collect();
-                if parts.len() >= 2 && parts[1] == pseudonym {
-                    let mut response = Response::new(Body::empty());
-                    *response.status_mut() = StatusCode::LOOP_DETECTED;
-                    return Some(response);
-                }
+        // Check if our pseudonym appears in any Via header
+        for entry in via_entries {
+            let parts: Vec<&str> = entry.split_whitespace().collect();
+            if parts.len() >= 2 && parts[1] == pseudonym {
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = StatusCode::LOOP_DETECTED;
+                return Some(response);
             }
         }
     }
@@ -360,12 +371,19 @@ fn process_max_forwards(request: &mut Request<Body>) -> Option<Response<Body>> {
     }
 }
 
+/// Headers that should be preserved for WebSocket upgrades
+static WEBSOCKET_HEADERS: &[&str] = &["connection", "upgrade"];
+
 /// Process Connection header and remove hop-by-hop headers
-fn process_connection_header(request: &mut Request<Body>) {
+fn process_connection_header(request: &mut Request<Body>, preserve_websocket: bool) {
     let mut headers_to_remove = HashSet::new();
 
     // Add standard hop-by-hop headers
     for &name in HOP_BY_HOP_HEADERS {
+        // Skip connection and upgrade headers if this is a WebSocket upgrade
+        if preserve_websocket && WEBSOCKET_HEADERS.contains(&name) {
+            continue;
+        }
         headers_to_remove.insert(HeaderName::from_static(name));
     }
 
@@ -375,15 +393,22 @@ fn process_connection_header(request: &mut Request<Body>) {
         .get_all(http::header::CONNECTION)
         .iter()
         .next()
+        && let Ok(connection_str) = connection.to_str()
     {
-        if let Ok(connection_str) = connection.to_str() {
-            for header in connection_str.split(',') {
-                let header = header.trim();
-                if let Ok(header_name) = HeaderName::from_str(header) {
-                    if is_hop_by_hop_header(&header_name) || !is_end_to_end_header(&header_name) {
-                        headers_to_remove.insert(header_name);
-                    }
-                }
+        for header in connection_str.split(',') {
+            let header = header.trim();
+            // Skip connection and upgrade headers if this is a WebSocket upgrade
+            if preserve_websocket
+                && WEBSOCKET_HEADERS
+                    .iter()
+                    .any(|h| header.eq_ignore_ascii_case(h))
+            {
+                continue;
+            }
+            if let Ok(header_name) = HeaderName::from_str(header)
+                && (is_hop_by_hop_header(&header_name) || !is_end_to_end_header(&header_name))
+            {
+                headers_to_remove.insert(header_name);
             }
         }
     }
@@ -430,25 +455,25 @@ fn add_via_header(request: &mut Request<Body>, config: &Rfc9110Config) -> Option
 
     // Get any existing Via headers
     let mut via_values = Vec::new();
-    if let Some(existing_via) = request.headers().get(http::header::VIA) {
-        if let Ok(existing_via_str) = existing_via.to_str() {
-            // If we're combining Via headers and have a pseudonym, replace all entries with our protocol version
-            if config.combine_via && config.pseudonym.is_some() {
-                let entries: Vec<_> = existing_via_str.split(',').map(|s| s.trim()).collect();
-                let all_same_protocol = entries.iter().all(|s| s.starts_with(protocol_version));
-                if all_same_protocol {
-                    let via = HeaderValue::from_str(&format!(
-                        "{} {}",
-                        protocol_version,
-                        config.pseudonym.as_ref().unwrap()
-                    ))
-                    .ok()?;
-                    request.headers_mut().insert(http::header::VIA, via.clone());
-                    return Some(via);
-                }
+    if let Some(existing_via) = request.headers().get(http::header::VIA)
+        && let Ok(existing_via_str) = existing_via.to_str()
+    {
+        // If we're combining Via headers and have a pseudonym, replace all entries with our protocol version
+        if config.combine_via && config.pseudonym.is_some() {
+            let entries: Vec<_> = existing_via_str.split(',').map(|s| s.trim()).collect();
+            let all_same_protocol = entries.iter().all(|s| s.starts_with(protocol_version));
+            if all_same_protocol {
+                let via = HeaderValue::from_str(&format!(
+                    "{} {}",
+                    protocol_version,
+                    config.pseudonym.as_ref().unwrap()
+                ))
+                .ok()?;
+                request.headers_mut().insert(http::header::VIA, via.clone());
+                return Some(via);
             }
-            via_values.extend(existing_via_str.split(',').map(|s| s.trim().to_string()));
         }
+        via_values.extend(existing_via_str.split(',').map(|s| s.trim().to_string()));
     }
 
     // Add our new Via header value
@@ -463,11 +488,15 @@ fn add_via_header(request: &mut Request<Body>, config: &Rfc9110Config) -> Option
 }
 
 /// Process response headers according to RFC9110
-fn process_response_headers(response: &mut Response<Body>) {
+fn process_response_headers(response: &mut Response<Body>, preserve_websocket: bool) {
     let mut headers_to_remove = HashSet::new();
 
     // Add standard hop-by-hop headers
     for &name in HOP_BY_HOP_HEADERS {
+        // Skip connection and upgrade headers if this is a WebSocket upgrade response
+        if preserve_websocket && WEBSOCKET_HEADERS.contains(&name) {
+            continue;
+        }
         headers_to_remove.insert(HeaderName::from_static(name));
     }
 
@@ -477,15 +506,22 @@ fn process_response_headers(response: &mut Response<Body>) {
         .get_all(http::header::CONNECTION)
         .iter()
         .next()
+        && let Ok(connection_str) = connection.to_str()
     {
-        if let Ok(connection_str) = connection.to_str() {
-            for header in connection_str.split(',') {
-                let header = header.trim();
-                if let Ok(header_name) = HeaderName::from_str(header) {
-                    if is_hop_by_hop_header(&header_name) || !is_end_to_end_header(&header_name) {
-                        headers_to_remove.insert(header_name);
-                    }
-                }
+        for header in connection_str.split(',') {
+            let header = header.trim();
+            // Skip connection and upgrade headers if this is a WebSocket upgrade response
+            if preserve_websocket
+                && WEBSOCKET_HEADERS
+                    .iter()
+                    .any(|h| header.eq_ignore_ascii_case(h))
+            {
+                continue;
+            }
+            if let Ok(header_name) = HeaderName::from_str(header)
+                && (is_hop_by_hop_header(&header_name) || !is_end_to_end_header(&header_name))
+            {
+                headers_to_remove.insert(header_name);
             }
         }
     }
@@ -508,21 +544,17 @@ fn process_response_headers(response: &mut Response<Body>) {
     }
 
     // Handle Via header in response
-    if let Some(via) = response.headers().get(http::header::VIA) {
-        if let Ok(via_str) = via.to_str() {
-            let entries = parse_via_header(via_str);
-            let _groups = group_by_protocol(entries);
+    if let Some(via) = response.headers().get(http::header::VIA)
+        && let Ok(via_str) = via.to_str()
+    {
+        let entries = parse_via_header(via_str);
+        let _groups = group_by_protocol(entries);
 
-            // If in firewall mode, replace all entries with "1.1 firewall"
-            if let Some(via_header) = response.headers().get(http::header::VIA) {
-                if let Ok(via_str) = via_header.to_str() {
-                    if via_str.contains("firewall") {
-                        response
-                            .headers_mut()
-                            .insert(http::header::VIA, HeaderValue::from_static("1.1 firewall"));
-                    }
-                }
-            }
+        // If in firewall mode, replace all entries with "1.1 firewall"
+        if via_str.contains("firewall") {
+            response
+                .headers_mut()
+                .insert(http::header::VIA, HeaderValue::from_static("1.1 firewall"));
         }
     }
 }
@@ -552,4 +584,12 @@ fn is_end_to_end_header(name: &HeaderName) -> bool {
             | "set-cookie"
             | "etag"
     )
+}
+
+/// Check if a request appears to be a WebSocket upgrade request.
+/// This is detected by the presence of sec-websocket-key and sec-websocket-version headers,
+/// which are required for all WebSocket handshakes per RFC 6455.
+fn is_websocket_upgrade_request(request: &Request<Body>) -> bool {
+    request.headers().contains_key("sec-websocket-key")
+        && request.headers().contains_key("sec-websocket-version")
 }
