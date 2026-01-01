@@ -30,6 +30,7 @@ async fn main() {
         server_names: Some(server_names),
         pseudonym: Some("example-proxy".to_string()),
         combine_via: true,
+        preserve_websocket_headers: true,
     };
 
     // Apply the RFC9110 middleware to the proxy

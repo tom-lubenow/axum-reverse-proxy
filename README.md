@@ -172,6 +172,7 @@ let config = Rfc9110Config {
     server_names: Some(server_names),  // For loop detection
     pseudonym: Some("myproxy".to_string()),  // For Via headers
     combine_via: true,  // Combine Via headers with same protocol
+    preserve_websocket_headers: true,  // Preserve WebSocket upgrade headers
 };
 
 // Create a proxy with RFC9110 compliance
