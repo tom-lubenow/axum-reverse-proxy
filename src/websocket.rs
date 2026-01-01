@@ -121,7 +121,7 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let upstream_url = format!("{}://{}{}", ws_scheme, authority, path_q);
+    let upstream_url = format!("{ws_scheme}://{authority}{path_q}");
 
     trace!("Connecting to upstream WebSocket at {}", upstream_url);
 
