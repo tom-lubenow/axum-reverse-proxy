@@ -235,8 +235,8 @@ where
             let max_forwards = request.headers().get(http::header::MAX_FORWARDS).cloned();
 
             // Detect WebSocket upgrade request to preserve necessary headers
-            let is_websocket = config.preserve_websocket_headers
-                && is_websocket_upgrade_request(&request);
+            let is_websocket =
+                config.preserve_websocket_headers && is_websocket_upgrade_request(&request);
 
             // 3. Process Connection header and remove hop-by-hop headers
             process_connection_header(&mut request, is_websocket);
@@ -251,8 +251,8 @@ where
             let mut response = inner.call(request).await?;
 
             // 6. Process response headers (preserve WebSocket headers for 101 responses too)
-            let is_websocket_response = is_websocket
-                && response.status() == StatusCode::SWITCHING_PROTOCOLS;
+            let is_websocket_response =
+                is_websocket && response.status() == StatusCode::SWITCHING_PROTOCOLS;
             process_response_headers(&mut response, is_websocket_response);
 
             // 7. Add Via header to response (use the same one we set in the request)

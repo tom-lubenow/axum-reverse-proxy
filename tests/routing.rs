@@ -420,7 +420,9 @@ async fn test_no_extra_slash_for_empty_path_with_query() {
         let path = req.uri().path().to_string();
         Json(json!({ "received_path": path }))
     });
-    let upstream = Router::new().route("/{*path}", echo_handler.clone()).route("/", echo_handler);
+    let upstream = Router::new()
+        .route("/{*path}", echo_handler.clone())
+        .route("/", echo_handler);
 
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
@@ -507,7 +509,9 @@ async fn test_similar_prefix_is_not_stripped() {
         let path = req.uri().path();
         Json(json!({ "received_path": path }))
     });
-    let upstream = Router::new().route("/{*path}", echo_handler.clone()).route("/", echo_handler);
+    let upstream = Router::new()
+        .route("/{*path}", echo_handler.clone())
+        .route("/", echo_handler);
 
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
@@ -555,10 +559,11 @@ async fn test_similar_prefix_is_not_stripped() {
 #[tokio::test]
 async fn test_root_base_query_only_no_slash() {
     // Upstream echoes the exact path
-    let echo_handler = get(|req: Request<Body>| async move {
-        Json(json!({ "received_path": req.uri().path() }))
-    });
-    let upstream = Router::new().route("/{*path}", echo_handler.clone()).route("/", echo_handler);
+    let echo_handler =
+        get(|req: Request<Body>| async move { Json(json!({ "received_path": req.uri().path() })) });
+    let upstream = Router::new()
+        .route("/{*path}", echo_handler.clone())
+        .route("/", echo_handler);
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
     let upstream_server = tokio::spawn(async move {
@@ -597,10 +602,11 @@ async fn test_root_base_query_only_no_slash() {
 #[tokio::test]
 async fn test_encoded_boundary_stripping() {
     // Upstream echoes the path
-    let echo_handler = get(|req: Request<Body>| async move {
-        Json(json!({ "received_path": req.uri().path() }))
-    });
-    let upstream = Router::new().route("/{*path}", echo_handler.clone()).route("/", echo_handler);
+    let echo_handler =
+        get(|req: Request<Body>| async move { Json(json!({ "received_path": req.uri().path() })) });
+    let upstream = Router::new()
+        .route("/{*path}", echo_handler.clone())
+        .route("/", echo_handler);
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
     let upstream_server = tokio::spawn(async move {
@@ -656,10 +662,11 @@ async fn test_encoded_boundary_stripping() {
 #[tokio::test]
 async fn test_root_base_matrix() {
     // Upstream echoes the path
-    let echo_handler = get(|req: Request<Body>| async move {
-        Json(json!({ "received_path": req.uri().path() }))
-    });
-    let upstream = Router::new().route("/{*path}", echo_handler.clone()).route("/", echo_handler);
+    let echo_handler =
+        get(|req: Request<Body>| async move { Json(json!({ "received_path": req.uri().path() })) });
+    let upstream = Router::new()
+        .route("/{*path}", echo_handler.clone())
+        .route("/", echo_handler);
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
     let upstream_server = tokio::spawn(async move {
@@ -678,11 +685,7 @@ async fn test_root_base_matrix() {
 
     let client = reqwest::Client::new();
 
-    let cases = [
-        ("/", "/api"),
-        ("/x", "/api/x"),
-        ("/x/", "/api/x/"),
-    ];
+    let cases = [("/", "/api"), ("/x", "/api/x"), ("/x/", "/api/x/")];
     for (req_path, expected) in cases {
         let res = client
             .get(format!("http://{proxy_addr}{req_path}"))
@@ -707,8 +710,20 @@ async fn test_methods_preserve_join() {
     };
 
     let upstream = Router::new()
-        .route("/{*path}", get(echo_handler.clone()).post(echo_handler.clone()).put(echo_handler.clone()).delete(echo_handler.clone()))
-        .route("/", get(echo_handler.clone()).post(echo_handler.clone()).put(echo_handler.clone()).delete(echo_handler));
+        .route(
+            "/{*path}",
+            get(echo_handler.clone())
+                .post(echo_handler.clone())
+                .put(echo_handler.clone())
+                .delete(echo_handler.clone()),
+        )
+        .route(
+            "/",
+            get(echo_handler.clone())
+                .post(echo_handler.clone())
+                .put(echo_handler.clone())
+                .delete(echo_handler),
+        );
 
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
@@ -727,28 +742,43 @@ async fn test_methods_preserve_join() {
     let client = reqwest::Client::new();
 
     // GET
-    let r = client.get(format!("http://{proxy_addr}/api/x")).send().await.unwrap();
+    let r = client
+        .get(format!("http://{proxy_addr}/api/x"))
+        .send()
+        .await
+        .unwrap();
     let b: Value = r.json().await.unwrap();
     assert_eq!(b["m"], "GET");
     assert_eq!(b["p"], "/tgt/x");
 
     // POST
-    let r = client.post(format!("http://{proxy_addr}/api/x")).body("hi").send().await.unwrap();
+    let r = client
+        .post(format!("http://{proxy_addr}/api/x"))
+        .body("hi")
+        .send()
+        .await
+        .unwrap();
     let b: Value = r.json().await.unwrap();
     assert_eq!(b["m"], "POST");
     assert_eq!(b["p"], "/tgt/x");
 
     // PUT
-    let r = client.put(format!("http://{proxy_addr}/api/x/"))
+    let r = client
+        .put(format!("http://{proxy_addr}/api/x/"))
         .body("hi")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     let b: Value = r.json().await.unwrap();
     assert_eq!(b["m"], "PUT");
     assert_eq!(b["p"], "/tgt/x/");
 
     // DELETE
-    let r = client.delete(format!("http://{proxy_addr}/api?flag=1"))
-        .send().await.unwrap();
+    let r = client
+        .delete(format!("http://{proxy_addr}/api?flag=1"))
+        .send()
+        .await
+        .unwrap();
     let b: Value = r.json().await.unwrap();
     assert_eq!(b["m"], "DELETE");
     assert_eq!(b["p"], "/tgt");

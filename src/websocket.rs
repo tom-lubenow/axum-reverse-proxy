@@ -1,4 +1,7 @@
-use axum::{body::Body, http::{Request, Response, Uri}};
+use axum::{
+    body::Body,
+    http::{Request, Response, Uri},
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, stream::StreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -103,9 +106,7 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
 
     // Build a ws:// or wss:// URL from the provided upstream HTTP URI (which already
     // has correct path+query joining applied)
-    let scheme = upstream_http_uri
-        .scheme_str()
-        .unwrap_or("http");
+    let scheme = upstream_http_uri.scheme_str().unwrap_or("http");
     let ws_scheme = match scheme {
         "wss" | "ws" => scheme,
         "https" => "wss",
