@@ -1,6 +1,6 @@
 use axum::body::Body;
-use http::{StatusCode, Uri};
 use http::uri::Builder as UriBuilder;
+use http::{StatusCode, Uri};
 use http_body_util::BodyExt;
 #[cfg(all(feature = "tls", not(feature = "native-tls")))]
 use hyper_rustls::HttpsConnector;
@@ -156,11 +156,7 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
         if websocket::is_websocket_upgrade(req.headers()) {
             trace!("Detected WebSocket upgrade request");
             // Build the upstream HTTP URI first, then let WS code map scheme
-            let path_q = req
-                .uri()
-                .path_and_query()
-                .map(|x| x.as_str())
-                .unwrap_or("");
+            let path_q = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("");
             let upstream_http_uri = self.transform_uri(path_q);
             match websocket::handle_websocket_with_upstream_uri(req, upstream_http_uri).await {
                 Ok(response) => return Ok(response),
@@ -175,17 +171,12 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
         }
 
         let forward_req = {
-            let path_q = req
-                .uri()
-                .path_and_query()
-                .map(|x| x.as_str())
-                .unwrap_or("");
+            let path_q = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("");
             let upstream_uri = self.transform_uri(path_q);
 
-            let mut builder =
-                axum::http::Request::builder()
-                    .method(req.method().clone())
-                    .uri(upstream_uri.clone());
+            let mut builder = axum::http::Request::builder()
+                .method(req.method().clone())
+                .uri(upstream_uri.clone());
 
             // Forward headers
             for (key, value) in req.headers() {
@@ -252,9 +243,7 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
             .parse()
             .expect("ReverseProxy target must be a valid URI");
 
-        let scheme = target_uri
-            .scheme_str()
-            .unwrap_or("http");
+        let scheme = target_uri.scheme_str().unwrap_or("http");
         let authority = target_uri
             .authority()
             .expect("ReverseProxy target must include authority (host)")
@@ -264,7 +253,11 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
         // Normalize target base path: drop trailing slash and treat "/" as empty
         let target_base_path = {
             let p = target_uri.path();
-            if p == "/" { "" } else { p.trim_end_matches('/') }
+            if p == "/" {
+                ""
+            } else {
+                p.trim_end_matches('/')
+            }
         };
 
         // Split incoming path and query
@@ -278,17 +271,27 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
             ""
         } else if !base_path.is_empty() && path_part.starts_with(base_path) {
             let rem = &path_part[base_path.len()..];
-            if rem.is_empty() || rem.starts_with('/') { rem } else { path_part }
+            if rem.is_empty() || rem.starts_with('/') {
+                rem
+            } else {
+                path_part
+            }
         } else {
             path_part
         };
 
         // Join target base path with remainder
         let joined_path = if remaining_path.is_empty() {
-            if target_base_path.is_empty() { "/" } else { target_base_path }
+            if target_base_path.is_empty() {
+                "/"
+            } else {
+                target_base_path
+            }
         } else {
             // remaining_path starts with '/'; concatenate without duplicating slash
-            if target_base_path.is_empty() { remaining_path } else { 
+            if target_base_path.is_empty() {
+                remaining_path
+            } else {
                 // allocate a small string to join
                 // SAFETY: both parts are valid path slices
                 // Build into a String for path_and_query

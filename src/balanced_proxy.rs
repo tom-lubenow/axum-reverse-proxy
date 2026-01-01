@@ -22,20 +22,15 @@ use crate::proxy::ReverseProxy;
 use rand::Rng;
 
 /// Load balancing strategy for distributing requests across discovered services
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LoadBalancingStrategy {
     /// Simple round-robin distribution (default)
+    #[default]
     RoundRobin,
     /// Power of Two Choices with pending request count as load metric
     P2cPendingRequests,
     /// Power of Two Choices with peak EWMA latency as load metric
     P2cPeakEwma,
-}
-
-impl Default for LoadBalancingStrategy {
-    fn default() -> Self {
-        Self::RoundRobin
-    }
 }
 
 #[derive(Clone)]
