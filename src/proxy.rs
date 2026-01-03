@@ -1,7 +1,6 @@
 use axum::body::Body;
 use http::uri::Builder as UriBuilder;
-use http::{StatusCode, Uri};
-use http_body_util::BodyExt;
+use http::Uri;
 #[cfg(all(feature = "tls", not(feature = "native-tls")))]
 use hyper_rustls::HttpsConnector;
 #[cfg(feature = "native-tls")]
@@ -11,9 +10,9 @@ use hyper_util::client::legacy::{
     connect::{Connect, HttpConnector},
 };
 use std::convert::Infallible;
-use tracing::{error, trace};
+use tracing::trace;
 
-use crate::websocket;
+use crate::forward::forward_request;
 
 /// A reverse proxy that forwards HTTP requests to an upstream server.
 ///
@@ -151,79 +150,12 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
         trace!("Proxying request method={} uri={}", req.method(), req.uri());
         trace!("Original headers headers={:?}", req.headers());
 
-        // Check if this is a WebSocket upgrade request
-        if websocket::is_websocket_upgrade(req.headers()) {
-            trace!("Detected WebSocket upgrade request");
-            // Build the upstream HTTP URI first, then let WS code map scheme
-            let path_q = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("");
-            let upstream_http_uri = self.transform_uri(path_q);
-            match websocket::handle_websocket_with_upstream_uri(req, upstream_http_uri).await {
-                Ok(response) => return Ok(response),
-                Err(e) => {
-                    error!("Failed to handle WebSocket upgrade: {}", e);
-                    return Ok(axum::http::Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::from(format!("WebSocket upgrade failed: {e}")))
-                        .unwrap());
-                }
-            }
-        }
+        // Transform the URI to the upstream target
+        let path_q = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("");
+        let upstream_uri = self.transform_uri(path_q);
 
-        let forward_req = {
-            let path_q = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("");
-            let upstream_uri = self.transform_uri(path_q);
-
-            let mut builder = axum::http::Request::builder()
-                .method(req.method().clone())
-                .uri(upstream_uri.clone());
-
-            // Forward headers
-            for (key, value) in req.headers() {
-                if key != "host" {
-                    builder = builder.header(key, value);
-                }
-            }
-
-            // Take the request body
-            let (parts, body) = req.into_parts();
-            drop(parts);
-            builder.body(body).unwrap()
-        };
-
-        trace!(
-            "Forwarding headers forwarded_headers={:?}",
-            forward_req.headers()
-        );
-
-        match self.client.request(forward_req).await {
-            Ok(res) => {
-                trace!(
-                    "Received response status={} headers={:?} version={:?}",
-                    res.status(),
-                    res.headers(),
-                    res.version()
-                );
-
-                let (parts, body) = res.into_parts();
-                let body = Body::from_stream(body.into_data_stream());
-
-                let mut response = axum::http::Response::new(body);
-                *response.status_mut() = parts.status;
-                *response.version_mut() = parts.version;
-                *response.headers_mut() = parts.headers;
-                Ok(response)
-            }
-            Err(e) => {
-                let error_msg = e.to_string();
-                error!("Proxy error occurred err={}", error_msg);
-                Ok(axum::http::Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from(format!(
-                        "Failed to connect to upstream server: {error_msg}"
-                    )))
-                    .unwrap())
-            }
-        }
+        // Use shared forwarding logic
+        forward_request(upstream_uri, req, &self.client).await
     }
 
     /// Transform an incoming request path+query into the target URI using http::Uri builder

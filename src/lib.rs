@@ -306,10 +306,12 @@ mod balanced_proxy;
 mod danger;
 #[cfg(feature = "dns")]
 mod dns_discovery;
+mod forward;
 mod proxy;
 mod retry;
 mod rfc9110;
 mod router;
+mod router_ext;
 mod websocket;
 
 pub use balanced_proxy::BalancedProxy;
@@ -326,3 +328,4 @@ pub use dns_discovery::{DnsDiscovery, DnsDiscoveryConfig, StaticDnsDiscovery};
 pub use proxy::ReverseProxy;
 pub use retry::RetryLayer;
 pub use rfc9110::{Rfc9110Config, Rfc9110Layer};
+pub use router_ext::{ProxyRouterExt, TargetResolver, TemplateTarget, proxy_template};
