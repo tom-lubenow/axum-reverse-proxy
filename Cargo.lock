@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "axum-reverse-proxy"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "async-stream",
  "axum",
