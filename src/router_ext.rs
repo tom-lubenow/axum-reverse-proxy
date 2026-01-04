@@ -28,7 +28,7 @@ use http::uri::Builder as UriBuilder;
 use std::convert::Infallible;
 use tracing::{error, trace};
 
-use crate::forward::{create_proxy_client, forward_request, ProxyClient};
+use crate::forward::{ProxyClient, create_proxy_client, forward_request};
 
 /// A trait for resolving the target URL for a proxy request.
 ///

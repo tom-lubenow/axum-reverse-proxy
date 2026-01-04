@@ -1,12 +1,5 @@
 use axum::body::Body;
-#[cfg(all(feature = "tls", not(feature = "native-tls")))]
-use hyper_rustls::HttpsConnector;
-#[cfg(feature = "native-tls")]
-use hyper_tls::HttpsConnector as NativeTlsHttpsConnector;
-use hyper_util::client::legacy::{
-    Client,
-    connect::{Connect, HttpConnector},
-};
+use hyper_util::client::legacy::{Client, connect::Connect};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -16,6 +9,7 @@ use std::time::{Duration, Instant};
 use tower::discover::{Change, Discover};
 use tracing::{debug, error, trace, warn};
 
+use crate::forward::{ProxyConnector, create_http_connector};
 use crate::proxy::ReverseProxy;
 
 // For custom P2C implementation
@@ -40,45 +34,19 @@ pub struct BalancedProxy<C: Connect + Clone + Send + Sync + 'static> {
     counter: Arc<AtomicUsize>,
 }
 
-#[cfg(all(feature = "tls", not(feature = "native-tls")))]
-pub type StandardBalancedProxy = BalancedProxy<HttpsConnector<HttpConnector>>;
-#[cfg(feature = "native-tls")]
-pub type StandardBalancedProxy = BalancedProxy<NativeTlsHttpsConnector<HttpConnector>>;
-#[cfg(all(not(feature = "tls"), not(feature = "native-tls")))]
-pub type StandardBalancedProxy = BalancedProxy<HttpConnector>;
+pub type StandardBalancedProxy = BalancedProxy<ProxyConnector>;
 
 impl StandardBalancedProxy {
     pub fn new<S>(path: S, targets: Vec<S>) -> Self
     where
         S: Into<String> + Clone,
     {
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
-        connector.enforce_http(false);
-        connector.set_keepalive(Some(std::time::Duration::from_secs(60)));
-        connector.set_connect_timeout(Some(std::time::Duration::from_secs(10)));
-        connector.set_reuse_address(true);
-
-        #[cfg(all(feature = "tls", not(feature = "native-tls")))]
-        let connector = {
-            use hyper_rustls::HttpsConnectorBuilder;
-            HttpsConnectorBuilder::new()
-                .with_native_roots()
-                .unwrap()
-                .https_or_http()
-                .enable_http1()
-                .wrap_connector(connector)
-        };
-
-        #[cfg(feature = "native-tls")]
-        let connector = NativeTlsHttpsConnector::new_with_connector(connector);
-
         let client = Client::builder(hyper_util::rt::TokioExecutor::new())
             .pool_idle_timeout(std::time::Duration::from_secs(60))
             .pool_max_idle_per_host(32)
             .retry_canceled_requests(true)
             .set_host(true)
-            .build(connector);
+            .build(create_http_connector());
 
         Self::new_with_client(path, targets, client)
     }
@@ -184,14 +152,7 @@ where
     p2c_balancer: Option<Arc<CustomP2cBalancer<C>>>,
 }
 
-#[cfg(all(feature = "tls", not(feature = "native-tls")))]
-pub type StandardDiscoverableBalancedProxy<D> =
-    DiscoverableBalancedProxy<HttpsConnector<HttpConnector>, D>;
-#[cfg(feature = "native-tls")]
-pub type StandardDiscoverableBalancedProxy<D> =
-    DiscoverableBalancedProxy<NativeTlsHttpsConnector<HttpConnector>, D>;
-#[cfg(all(not(feature = "tls"), not(feature = "native-tls")))]
-pub type StandardDiscoverableBalancedProxy<D> = DiscoverableBalancedProxy<HttpConnector, D>;
+pub type StandardDiscoverableBalancedProxy<D> = DiscoverableBalancedProxy<ProxyConnector, D>;
 
 impl<C, D> DiscoverableBalancedProxy<C, D>
 where

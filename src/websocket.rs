@@ -49,14 +49,16 @@ pub(crate) fn is_websocket_upgrade(headers: &HeaderMap<HeaderValue>) -> bool {
     has_upgrade && has_connection && has_websocket_key && has_websocket_version
 }
 
-#[cfg(test)]
-pub(crate) fn compute_host_header(url: &str) -> (String, u16) {
-    let url = Url::parse(url).unwrap();
+/// Compute the host header value for a WebSocket URL.
+///
+/// Returns (host_header, port) where host_header includes the port only if non-default.
+fn compute_host_header_from_url(url: &Url) -> (String, u16) {
     let scheme = url.scheme();
-    let host = match url.host().unwrap() {
-        Host::Ipv6(addr) => format!("[{addr}]"),
-        Host::Ipv4(addr) => addr.to_string(),
-        Host::Domain(s) => s.to_string(),
+    let host = match url.host() {
+        Some(Host::Ipv6(addr)) => format!("[{addr}]"),
+        Some(Host::Ipv4(addr)) => addr.to_string(),
+        Some(Host::Domain(s)) => s.to_string(),
+        None => "localhost".to_string(),
     };
     let port = match url.port() {
         Some(p) => p,
@@ -74,6 +76,12 @@ pub(crate) fn compute_host_header(url: &str) -> (String, u16) {
         format!("{host}:{port}")
     };
     (header, port)
+}
+
+#[cfg(test)]
+fn compute_host_header(url: &str) -> (String, u16) {
+    let url = Url::parse(url).unwrap();
+    compute_host_header_from_url(&url)
 }
 
 /// Handle a WebSocket upgrade request by:
@@ -125,29 +133,9 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
 
     trace!("Connecting to upstream WebSocket at {}", upstream_url);
 
-    // Parse the URL to get the host and scheme
+    // Parse the URL and compute the host header
     let url = Url::parse(&upstream_url)?;
-    let scheme = url.scheme();
-    let host = match url.host().ok_or("Missing host in URL")? {
-        Host::Ipv6(addr) => format!("[{addr}]"),
-        Host::Ipv4(addr) => addr.to_string(),
-        Host::Domain(s) => s.to_string(),
-    };
-    let port = match url.port() {
-        Some(p) => p,
-        None => {
-            if scheme == "wss" {
-                443
-            } else {
-                80
-            }
-        }
-    };
-    let host_header = if (scheme == "wss" && port == 443) || (scheme == "ws" && port == 80) {
-        host.clone()
-    } else {
-        format!("{host}:{port}")
-    };
+    let (host_header, _port) = compute_host_header_from_url(&url);
 
     // Forward all headers except host to upstream
     let mut request = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
