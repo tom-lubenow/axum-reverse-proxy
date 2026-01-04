@@ -1,18 +1,11 @@
 use axum::body::Body;
-use http::uri::Builder as UriBuilder;
 use http::Uri;
-#[cfg(all(feature = "tls", not(feature = "native-tls")))]
-use hyper_rustls::HttpsConnector;
-#[cfg(feature = "native-tls")]
-use hyper_tls::HttpsConnector as NativeTlsHttpsConnector;
-use hyper_util::client::legacy::{
-    Client,
-    connect::{Connect, HttpConnector},
-};
+use http::uri::Builder as UriBuilder;
+use hyper_util::client::legacy::{Client, connect::Connect};
 use std::convert::Infallible;
 use tracing::trace;
 
-use crate::forward::forward_request;
+use crate::forward::{ProxyConnector, create_http_connector, forward_request};
 
 /// A reverse proxy that forwards HTTP requests to an upstream server.
 ///
@@ -26,12 +19,7 @@ pub struct ReverseProxy<C: Connect + Clone + Send + Sync + 'static> {
     client: Client<C, Body>,
 }
 
-#[cfg(all(feature = "tls", not(feature = "native-tls")))]
-pub type StandardReverseProxy = ReverseProxy<HttpsConnector<HttpConnector>>;
-#[cfg(feature = "native-tls")]
-pub type StandardReverseProxy = ReverseProxy<NativeTlsHttpsConnector<HttpConnector>>;
-#[cfg(all(not(feature = "tls"), not(feature = "native-tls")))]
-pub type StandardReverseProxy = ReverseProxy<HttpConnector>;
+pub type StandardReverseProxy = ReverseProxy<ProxyConnector>;
 
 impl StandardReverseProxy {
     /// Creates a new `ReverseProxy` instance.
@@ -52,32 +40,12 @@ impl StandardReverseProxy {
     where
         S: Into<String>,
     {
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
-        connector.enforce_http(false);
-        connector.set_keepalive(Some(std::time::Duration::from_secs(60)));
-        connector.set_connect_timeout(Some(std::time::Duration::from_secs(10)));
-        connector.set_reuse_address(true);
-
-        #[cfg(all(feature = "tls", not(feature = "native-tls")))]
-        let connector = {
-            use hyper_rustls::HttpsConnectorBuilder;
-            HttpsConnectorBuilder::new()
-                .with_webpki_roots()
-                .https_or_http()
-                .enable_http1()
-                .wrap_connector(connector)
-        };
-
-        #[cfg(feature = "native-tls")]
-        let connector = NativeTlsHttpsConnector::new_with_connector(connector);
-
         let client = Client::builder(hyper_util::rt::TokioExecutor::new())
             .pool_idle_timeout(std::time::Duration::from_secs(60))
             .pool_max_idle_per_host(32)
             .retry_canceled_requests(true)
             .set_host(true)
-            .build(connector);
+            .build(create_http_connector());
 
         Self::new_with_client(path, target, client)
     }

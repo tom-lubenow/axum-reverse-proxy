@@ -32,7 +32,7 @@ use axum::{
     http::{HeaderValue, Method, Request, Response, StatusCode, header::HeaderName},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     future::Future,
     pin::Pin,
     str::FromStr,
@@ -105,23 +105,12 @@ impl std::fmt::Display for ViaEntry {
 }
 
 /// Parse a Via header value into a vector of ViaEntry structs
+#[allow(dead_code)] // Kept for future extensibility
 fn parse_via_header(header: &str) -> Vec<ViaEntry> {
     header
         .split(',')
         .filter_map(|entry| ViaEntry::parse(entry.trim()))
         .collect()
-}
-
-/// Group Via entries by protocol version
-fn group_by_protocol(entries: Vec<ViaEntry>) -> HashMap<String, Vec<ViaEntry>> {
-    let mut groups = HashMap::new();
-    for entry in entries {
-        groups
-            .entry(entry.protocol.clone())
-            .or_insert_with(Vec::new)
-            .push(entry);
-    }
-    groups
 }
 
 /// Configuration for RFC9110 middleware
@@ -543,19 +532,14 @@ fn process_response_headers(response: &mut Response<Body>, preserve_websocket: b
         response.headers_mut().remove(&header);
     }
 
-    // Handle Via header in response
+    // Handle Via header in response - if in firewall mode, replace all entries with "1.1 firewall"
     if let Some(via) = response.headers().get(http::header::VIA)
         && let Ok(via_str) = via.to_str()
+        && via_str.contains("firewall")
     {
-        let entries = parse_via_header(via_str);
-        let _groups = group_by_protocol(entries);
-
-        // If in firewall mode, replace all entries with "1.1 firewall"
-        if via_str.contains("firewall") {
-            response
-                .headers_mut()
-                .insert(http::header::VIA, HeaderValue::from_static("1.1 firewall"));
-        }
+        response
+            .headers_mut()
+            .insert(http::header::VIA, HeaderValue::from_static("1.1 firewall"));
     }
 }
 

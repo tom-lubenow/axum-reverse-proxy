@@ -7,7 +7,7 @@ use http_body_util::BodyExt;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 #[cfg(feature = "native-tls")]
 use hyper_tls::HttpsConnector as NativeTlsHttpsConnector;
-use hyper_util::client::legacy::{connect::Connect, connect::HttpConnector, Client};
+use hyper_util::client::legacy::{Client, connect::Connect, connect::HttpConnector};
 use std::convert::Infallible;
 use tracing::{error, trace};
 
@@ -22,8 +22,19 @@ pub(crate) type ProxyClient = Client<NativeTlsHttpsConnector<HttpConnector>, Bod
 #[cfg(all(not(feature = "tls"), not(feature = "native-tls")))]
 pub(crate) type ProxyClient = Client<HttpConnector, Body>;
 
-/// Create a new HTTP client configured for proxying.
-pub(crate) fn create_proxy_client() -> ProxyClient {
+#[cfg(all(feature = "tls", not(feature = "native-tls")))]
+pub(crate) type ProxyConnector = HttpsConnector<HttpConnector>;
+
+#[cfg(feature = "native-tls")]
+pub(crate) type ProxyConnector = NativeTlsHttpsConnector<HttpConnector>;
+
+#[cfg(all(not(feature = "tls"), not(feature = "native-tls")))]
+pub(crate) type ProxyConnector = HttpConnector;
+
+/// Create an HTTP connector configured for proxying with standard settings.
+///
+/// This is the shared connector configuration used by all proxy types.
+pub(crate) fn create_http_connector() -> ProxyConnector {
     let mut connector = HttpConnector::new();
     connector.set_nodelay(true);
     connector.enforce_http(false);
@@ -41,12 +52,17 @@ pub(crate) fn create_proxy_client() -> ProxyClient {
     #[cfg(feature = "native-tls")]
     let connector = NativeTlsHttpsConnector::new_with_connector(connector);
 
+    connector
+}
+
+/// Create a new HTTP client configured for proxying.
+pub(crate) fn create_proxy_client() -> ProxyClient {
     Client::builder(hyper_util::rt::TokioExecutor::new())
         .pool_idle_timeout(std::time::Duration::from_secs(60))
         .pool_max_idle_per_host(32)
         .retry_canceled_requests(true)
         .set_host(true)
-        .build(connector)
+        .build(create_http_connector())
 }
 
 /// Forward a request to the given upstream URI.
