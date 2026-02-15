@@ -308,14 +308,14 @@ async fn test_websocket_binary() {
     // Send a binary message
     let test_data = vec![1, 2, 3, 4, 5];
     ws_stream
-        .send(tungstenite::Message::Binary(test_data.clone()))
+        .send(tungstenite::Message::Binary(test_data.clone().into()))
         .await
         .expect("Failed to send binary message");
 
     // Receive the echo response
     if let Some(msg) = ws_stream.next().await {
         let msg = msg.expect("Failed to get message");
-        assert_eq!(msg, tungstenite::Message::Binary(test_data));
+        assert_eq!(msg, tungstenite::Message::Binary(test_data.into()));
     } else {
         panic!("Did not receive response");
     }
@@ -334,7 +334,7 @@ async fn test_websocket_ping_pong() {
     // Send a ping frame and expect a pong response with the same payload
     let ping_payload = b"hello".to_vec();
     ws_stream
-        .send(tungstenite::Message::Ping(ping_payload.clone()))
+        .send(tungstenite::Message::Ping(ping_payload.clone().into()))
         .await
         .expect("Failed to send ping message");
 
@@ -355,7 +355,7 @@ async fn test_websocket_ping_pong() {
 
     // Send a pong frame which should be ignored by the server
     ws_stream
-        .send(tungstenite::Message::Pong(Vec::new()))
+        .send(tungstenite::Message::Pong(Vec::new().into()))
         .await
         .expect("Failed to send pong message");
 

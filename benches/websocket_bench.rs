@@ -84,7 +84,7 @@ async fn bench_websocket_echo(
     for _ in 0..iterations {
         // Send the test message
         ws_stream
-            .send(tungstenite::Message::Text(test_message.clone()))
+            .send(tungstenite::Message::Text(test_message.clone().into()))
             .await?;
 
         // Receive the echo response

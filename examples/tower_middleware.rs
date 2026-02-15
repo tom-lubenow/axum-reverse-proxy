@@ -15,6 +15,7 @@ struct AppState {
     app_name: String,
 }
 
+#[allow(deprecated)] // ValidateRequestHeaderLayer::bearer
 #[tokio::main]
 async fn main() {
     // Initialize tracing
@@ -48,7 +49,10 @@ async fn main() {
         proxy_router.layer(
             ServiceBuilder::new()
                 // Add request timeout
-                .layer(TimeoutLayer::new(Duration::from_secs(10)))
+                .layer(TimeoutLayer::with_status_code(
+                    http::StatusCode::REQUEST_TIMEOUT,
+                    Duration::from_secs(10),
+                ))
                 // Require API key for /api routes
                 .layer(ValidateRequestHeaderLayer::bearer("secret-api-key"))
                 // Add custom header

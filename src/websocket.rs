@@ -2,16 +2,14 @@ use axum::{
     body::Body,
     http::{Request, Response, Uri},
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, stream::StreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper_util::rt::TokioIo;
-use sha1::{Digest, Sha1};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{Error, Message},
+    tungstenite::{Error, Message, handshake::derive_accept_key},
 };
 use tracing::{error, trace};
 use url::{Host, Url};
@@ -107,10 +105,7 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
         .ok_or("Missing or invalid Sec-WebSocket-Key header")?;
 
     // Calculate the WebSocket accept key
-    let mut hasher = Sha1::new();
-    hasher.update(ws_key.as_bytes());
-    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    let ws_accept = STANDARD.encode(hasher.finalize());
+    let ws_accept = derive_accept_key(ws_key.as_bytes());
 
     // Build a ws:// or wss:// URL from the provided upstream HTTP URI (which already
     // has correct path+query joining applied)
