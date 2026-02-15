@@ -22,7 +22,7 @@ jobs:
       - name: Check package version
         if: github.event_name == 'release'
         run: |
-          VERSION=$(nix develop --command cargo metadata --format-version=1 | jq -r '.packages[] | select(.name == "axum-reverse-proxy") | .version')
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           TAG=${GITHUB_REF#refs/tags/}
           if [ "v$VERSION" != "$TAG" ]; then
             echo "Package version ($VERSION) does not match release tag ($TAG)"
