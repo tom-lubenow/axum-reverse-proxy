@@ -1,6 +1,6 @@
 [package]
 name = "axum-reverse-proxy"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2024"
 description = "A flexible and efficient reverse proxy implementation for Axum web applications"
 license = "MIT"
@@ -13,7 +13,6 @@ authors = ["Tom Lubenow"]
 
 [dependencies]
 axum = { version = "^0.8", features = ["ws"] }
-base64 = "^0.21"
 bytes = "^1.5"
 futures-util = "^0.3"
 http = "^1.0"
@@ -25,10 +24,9 @@ hyper-tls = { version = "^0.6", optional = true }
 hyper-util = { version = "^0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 native-tls = { version = "^0.2", optional = true }
 rustls = { version = "^0.23", optional = true }
-sha1 = "^0.10"
 tokio = { version = "^1.45", features = ["full"] }
 tokio-native-tls = { version = "^0.3", optional = true }
-tokio-tungstenite = "^0.21"
+tokio-tungstenite = "^0.28"
 tower = { version = "^0.5", features = ["full"] }
 tracing = "^0.1"
 url = "^2.5"
@@ -39,7 +37,7 @@ rand = "0.9.1"
 async-stream = "^0.3"
 criterion = { version = "^0.5", features = ["async", "futures"] }
 rcgen = "^0.13"
-reqwest = { version = "^0.11", features = ["json"] }
+reqwest = { version = "^0.12", features = ["json"] }
 serde_json = "^1.0"
 tokio = { version = "^1.45", features = ["full", "test-util"] }
 tokio-rustls = "^0.26"

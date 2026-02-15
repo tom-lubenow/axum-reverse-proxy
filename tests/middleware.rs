@@ -11,8 +11,10 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
-use tower_http::{timeout::TimeoutLayer, validate_request::ValidateRequestHeaderLayer};
+use tower_http::timeout::TimeoutLayer;
+use tower_http::validate_request::ValidateRequestHeaderLayer;
 
+#[allow(deprecated)] // ValidateRequestHeaderLayer::bearer is deprecated in tower-http 0.6.8
 #[tokio::test]
 async fn test_proxy_with_middleware() {
     // Create a test server that echoes headers
@@ -42,7 +44,10 @@ async fn test_proxy_with_middleware() {
     let app = proxy_router.layer(
         ServiceBuilder::new()
             // Add request timeout
-            .layer(TimeoutLayer::new(Duration::from_secs(10)))
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                Duration::from_secs(10),
+            ))
             // Require API key
             .layer(ValidateRequestHeaderLayer::bearer("test-token"))
             // Add custom header
@@ -133,7 +138,10 @@ async fn test_proxy_timeout_middleware() {
     let proxy_router: Router = proxy.into();
 
     // Add timeout middleware
-    let app = proxy_router.layer(TimeoutLayer::new(Duration::from_millis(100)));
+    let app = proxy_router.layer(TimeoutLayer::with_status_code(
+        StatusCode::REQUEST_TIMEOUT,
+        Duration::from_millis(100),
+    ));
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
