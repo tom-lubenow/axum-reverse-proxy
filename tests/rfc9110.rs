@@ -91,9 +91,7 @@ async fn create_capturing_app(config: Option<Rfc9110Config>) -> CaptureBackendAp
             .merge(proxy_router)
             .layer(Rfc9110Layer::with_config(config))
     } else {
-        Router::new()
-            .merge(proxy_router)
-            .layer(Rfc9110Layer::new())
+        Router::new().merge(proxy_router).layer(Rfc9110Layer::new())
     };
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
