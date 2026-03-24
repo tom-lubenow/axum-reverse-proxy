@@ -64,8 +64,10 @@ async fn setup_test_server(target_prefix: &str) -> (SocketAddr, SocketAddr) {
         .try_init()
         .ok();
 
-    // Create a WebSocket echo server
-    let app = Router::new().route("/ws", get(websocket_handler));
+    // Create a WebSocket echo server (register with and without trailing slash)
+    let app = Router::new()
+        .route("/ws", get(websocket_handler))
+        .route("/ws/", get(websocket_handler));
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
     info!("Upstream server listening on {}", upstream_addr);
@@ -256,16 +258,20 @@ async fn test_websocket_with_complex_connection_header() {
 }
 
 #[tokio::test]
-async fn test_websocket_with_https() {
+async fn test_websocket_with_https_returns_error() {
+    // tokio_tungstenite does not have TLS features enabled, so WebSocket
+    // proxying to wss:// upstreams is expected to fail. The proxy should
+    // return an error response instead of a misleading 101.
     let (_upstream_addr, proxy_addr) = setup_test_server("https://").await;
 
     let url = format!("ws://127.0.0.1:{}/ws", proxy_addr.port());
-    let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .expect("Failed to connect with HTTPS upstream");
+    let result = tokio_tungstenite::connect_async(&url).await;
 
-    debug!("Successfully connected to HTTPS upstream");
-    drop(ws_stream);
+    assert!(
+        result.is_err(),
+        "Expected error when proxying to HTTPS upstream without TLS support"
+    );
+    debug!("Correctly rejected HTTPS upstream without TLS support");
 }
 
 #[tokio::test]

@@ -5,10 +5,11 @@ use axum::{
 use futures_util::{SinkExt, stream::StreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper_util::rt::TokioIo;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::{
-    connect_async,
+    MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Error, Message, handshake::derive_accept_key},
 };
 use tracing::{error, trace};
@@ -87,7 +88,15 @@ fn compute_host_header(url: &str) -> (String, u16) {
 /// 2. Computing the WebSocket accept key
 /// 3. Establishing a connection to the upstream server
 /// 4. Returning an upgrade response to the client
-/// 5. Spawning a task to handle the WebSocket connection
+/// 5. Spawning a task to bridge the client and upstream WebSocket connections
+///
+/// The upstream WebSocket connection is established **before** the 101 response is
+/// returned to the client. This ensures the client only receives a successful upgrade
+/// if the upstream server actually accepted the WebSocket connection.
+///
+/// `Sec-WebSocket-Extensions` headers are stripped when forwarding to upstream because
+/// the proxy performs frame-level forwarding (not raw byte forwarding) and cannot
+/// transparently handle extensions like `permessage-deflate`.
 ///
 /// This function follows the WebSocket protocol specification (RFC 6455) for the upgrade handshake.
 /// It ensures that all required headers are properly handled and forwarded to the upstream server.
@@ -132,13 +141,15 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
     let url = Url::parse(&upstream_url)?;
     let (host_header, _port) = compute_host_header_from_url(&url);
 
-    // Forward all headers except host to upstream
+    // Forward all headers except host and sec-websocket-extensions to upstream.
+    // Extensions are stripped because the proxy performs frame-level forwarding and
+    // cannot transparently handle negotiated extensions (e.g. permessage-deflate).
     let mut request = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
         .uri(upstream_url)
         .header("host", host_header);
 
     for (key, value) in req.headers() {
-        if key != "host" {
+        if key != "host" && key != "sec-websocket-extensions" {
             request = request.header(key.as_str(), value);
         }
     }
@@ -149,20 +160,35 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
     // Log the request headers
     trace!("Upstream request headers: {:?}", request.headers());
 
-    // Return a response that indicates the connection has been upgraded
-    trace!("Returning upgrade response to client");
-    let response = Response::builder()
+    // Connect to upstream WebSocket BEFORE returning 101 to the client.
+    // This ensures we only tell the client the upgrade succeeded if the
+    // upstream actually accepted the WebSocket connection.
+    let (upstream_ws, upstream_response) = timeout(Duration::from_secs(5), connect_async(request))
+        .await
+        .map_err(|_| "Upstream WebSocket connection timed out")??;
+
+    trace!("Upstream WebSocket connected successfully");
+
+    // Build 101 response for client
+    let mut response_builder = Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header("Upgrade", "websocket")
         .header("Connection", "Upgrade")
-        .header("Sec-WebSocket-Accept", ws_accept)
-        .body(Body::empty())?;
+        .header("Sec-WebSocket-Accept", ws_accept);
 
-    // Spawn a task to handle the WebSocket connection
+    // Forward negotiated sub-protocol from upstream if present
+    if let Some(protocol) = upstream_response.headers().get("sec-websocket-protocol") {
+        response_builder = response_builder.header("Sec-WebSocket-Protocol", protocol);
+    }
+
+    trace!("Returning upgrade response to client");
+    let response = response_builder.body(Body::empty())?;
+
+    // Spawn a task to bridge the client and upstream WebSocket connections
     let (parts, body) = req.into_parts();
     let req = Request::from_parts(parts, body);
     tokio::spawn(async move {
-        match handle_websocket_connection(req, request).await {
+        match handle_websocket_bridge(req, upstream_ws).await {
             Ok(_) => trace!("WebSocket connection closed gracefully"),
             Err(e) => error!("WebSocket connection error: {}", e),
         }
@@ -171,11 +197,11 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
     Ok(response)
 }
 
-/// Handle an established WebSocket connection by forwarding frames between the client and upstream server.
+/// Bridge an upgraded client connection with an already-connected upstream WebSocket.
 ///
 /// This function:
-/// 1. Upgrades the HTTP connection to a WebSocket connection
-/// 2. Establishes a WebSocket connection to the upstream server
+/// 1. Completes the HTTP upgrade on the client connection
+/// 2. Wraps both connections as WebSocket streams
 /// 3. Creates two tasks for bidirectional message forwarding:
 ///    - Client to upstream: forwards messages from the client to the upstream server
 ///    - Upstream to client: forwards messages from the upstream server to the client
@@ -191,9 +217,9 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
 /// - The connection is dropped
 ///
 /// When a close frame is received, it is properly forwarded to ensure clean connection termination.
-async fn handle_websocket_connection(
+async fn handle_websocket_bridge(
     req: Request<Body>,
-    upstream_request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    upstream_ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let upgraded = match timeout(Duration::from_secs(5), hyper::upgrade::on(req)).await {
         Ok(Ok(upgraded)) => upgraded,
@@ -208,13 +234,6 @@ async fn handle_websocket_connection(
         None,
     )
     .await;
-
-    let (upstream_ws, _) =
-        match timeout(Duration::from_secs(5), connect_async(upstream_request)).await {
-            Ok(Ok(conn)) => conn,
-            Ok(Err(e)) => return Err(Box::new(e)),
-            Err(e) => return Err(Box::new(e)),
-        };
 
     let (mut client_sender, mut client_receiver) = client_ws.split();
     let (mut upstream_sender, mut upstream_receiver) = upstream_ws.split();
