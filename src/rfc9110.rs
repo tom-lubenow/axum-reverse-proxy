@@ -230,9 +230,6 @@ where
             // 3. Process Connection header and remove hop-by-hop headers
             process_connection_header(&mut request, is_websocket);
 
-            // Save end-to-end headers after processing Connection header
-            let preserved_headers = request.headers().clone();
-
             // 4. Add Via header and save it for the response
             let via_header = add_via_header(&mut request, &config);
 
@@ -267,13 +264,6 @@ where
                 response
                     .headers_mut()
                     .insert(http::header::MAX_FORWARDS, max_forwards);
-            }
-
-            // 9. Restore preserved end-to-end headers
-            for (name, value) in preserved_headers.iter() {
-                if !is_hop_by_hop_header(name) {
-                    response.headers_mut().insert(name, value.clone());
-                }
             }
 
             Ok(response)

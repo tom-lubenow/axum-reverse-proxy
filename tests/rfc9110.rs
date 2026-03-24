@@ -1,14 +1,25 @@
 use axum::{
     Router,
     body::{Body, to_bytes},
-    http::{Method, Request, StatusCode},
+    extract::State,
+    http::{Method, Request, StatusCode, header::HeaderMap},
+    routing::any,
 };
 use axum_reverse_proxy::{ReverseProxy, Rfc9110Config, Rfc9110Layer};
 use http::HeaderValue;
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc, time::Duration};
+use tokio::net::TcpListener;
+use tokio::sync::{Mutex, Notify};
 use tower::ServiceExt;
 
-/// Helper function to create a test app with RFC9110 middleware
+type CapturedHeaders = Arc<Mutex<Option<HeaderMap>>>;
+
+/// Backend handler that captures the forwarded request headers into shared state.
+async fn capture_headers(State(captured): State<CapturedHeaders>, req: Request<Body>) {
+    *captured.lock().await = Some(req.headers().clone());
+}
+
+/// Helper function to create a test app with RFC9110 middleware (no real backend)
 fn create_test_app(config: Option<Rfc9110Config>) -> Router {
     let proxy = ReverseProxy::new("/", "http://example.com");
     let proxy_router: Router = proxy.into();
@@ -18,6 +29,87 @@ fn create_test_app(config: Option<Rfc9110Config>) -> Router {
         app.layer(Rfc9110Layer::with_config(config))
     } else {
         app.layer(Rfc9110Layer::new())
+    }
+}
+
+fn create_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+}
+
+struct CaptureBackendApp {
+    proxy_addr: std::net::SocketAddr,
+    captured_headers: CapturedHeaders,
+    _backend_handle: tokio::task::JoinHandle<()>,
+    _proxy_handle: tokio::task::JoinHandle<()>,
+}
+
+impl CaptureBackendApp {
+    async fn upstream_received_headers(&self) -> HeaderMap {
+        self.captured_headers
+            .lock()
+            .await
+            .clone()
+            .expect("no request was captured by the backend")
+    }
+}
+
+impl Drop for CaptureBackendApp {
+    fn drop(&mut self) {
+        self._backend_handle.abort();
+        self._proxy_handle.abort();
+    }
+}
+
+/// Creates a proxy backed by a backend that captures the forwarded request
+/// headers into shared state. Assert on `upstream_received_headers()` for
+/// request-forwarding behavior, or on the `reqwest::Response` for response behavior.
+async fn create_capturing_app(config: Option<Rfc9110Config>) -> CaptureBackendApp {
+    let captured_headers: CapturedHeaders = Arc::new(Mutex::new(None));
+
+    let backend = Router::new()
+        .route("/{*path}", any(capture_headers))
+        .with_state(captured_headers.clone());
+
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend_listener.local_addr().unwrap();
+    let backend_ready = Arc::new(Notify::new());
+    let backend_ready_clone = backend_ready.clone();
+
+    let backend_handle = tokio::spawn(async move {
+        backend_ready_clone.notify_one();
+        axum::serve(backend_listener, backend).await.unwrap();
+    });
+    backend_ready.notified().await;
+
+    let proxy = ReverseProxy::new("/", &format!("http://{backend_addr}"));
+    let proxy_router: Router = proxy.into();
+    let app = if let Some(config) = config {
+        Router::new()
+            .merge(proxy_router)
+            .layer(Rfc9110Layer::with_config(config))
+    } else {
+        Router::new().merge(proxy_router).layer(Rfc9110Layer::new())
+    };
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let proxy_ready = Arc::new(Notify::new());
+    let proxy_ready_clone = proxy_ready.clone();
+
+    let proxy_handle = tokio::spawn(async move {
+        proxy_ready_clone.notify_one();
+        axum::serve(proxy_listener, app).await.unwrap();
+    });
+    proxy_ready.notified().await;
+
+    CaptureBackendApp {
+        proxy_addr,
+        captured_headers,
+        _backend_handle: backend_handle,
+        _proxy_handle: proxy_handle,
     }
 }
 
@@ -220,43 +312,43 @@ async fn test_loop_detection() {
 
 #[tokio::test]
 async fn test_unknown_headers_forwarded() {
-    let app = create_test_app(None);
+    let app = create_capturing_app(None).await;
+    let client = create_client();
 
-    let request = Request::builder()
-        .uri("/test")
+    client
+        .get(format!("http://{}/test", app.proxy_addr))
         .header("X-Custom-Unknown", "value")
-        .body(Body::empty())
+        .send()
+        .await
         .unwrap();
 
-    let response = app.clone().oneshot(request).await.unwrap();
-
-    // Unknown headers should be forwarded
+    let upstream_headers = app.upstream_received_headers().await;
     assert_eq!(
-        response.headers().get("x-custom-unknown").unwrap(),
+        upstream_headers.get("x-custom-unknown").unwrap(),
         HeaderValue::from_static("value")
     );
 }
 
 #[tokio::test]
 async fn test_end_to_end_headers_preserved() {
-    let app = create_test_app(None);
+    let app = create_capturing_app(None).await;
+    let client = create_client();
 
-    let request = Request::builder()
-        .uri("/test")
+    client
+        .get(format!("http://{}/test", app.proxy_addr))
         .header("Cache-Control", "no-cache")
         .header("Authorization", "Bearer token")
-        .body(Body::empty())
+        .send()
+        .await
         .unwrap();
 
-    let response = app.clone().oneshot(request).await.unwrap();
-
-    // End-to-end headers should be preserved
+    let upstream_headers = app.upstream_received_headers().await;
     assert_eq!(
-        response.headers().get("cache-control").unwrap(),
+        upstream_headers.get("cache-control").unwrap(),
         HeaderValue::from_static("no-cache")
     );
     assert_eq!(
-        response.headers().get("authorization").unwrap(),
+        upstream_headers.get("authorization").unwrap(),
         HeaderValue::from_static("Bearer token")
     );
 }
@@ -485,20 +577,22 @@ async fn test_loop_detection_with_ip() {
 
 #[tokio::test]
 async fn test_connection_header_with_end_to_end_field() {
-    let app = create_test_app(None);
+    let app = create_capturing_app(None).await;
+    let client = create_client();
 
-    let request = Request::builder()
-        .uri("/test")
+    client
+        .get(format!("http://{}/test", app.proxy_addr))
         .header("Connection", "Cache-Control")
         .header("Cache-Control", "no-cache")
-        .body(Body::empty())
+        .send()
+        .await
         .unwrap();
 
-    let response = app.clone().oneshot(request).await.unwrap();
-
-    // Cache-Control should be preserved even if listed in Connection
-    assert!(response.headers().contains_key("cache-control"));
-    assert!(!response.headers().contains_key("connection"));
+    let upstream_headers = app.upstream_received_headers().await;
+    // Cache-Control should be forwarded to upstream even if listed in Connection
+    assert!(upstream_headers.contains_key("cache-control"));
+    // Connection header itself should not be forwarded
+    assert!(!upstream_headers.contains_key("connection"));
 }
 
 #[tokio::test]
@@ -553,19 +647,21 @@ async fn test_via_header_combining_same_protocol() {
 
 #[tokio::test]
 async fn test_unknown_protocol_elements() {
-    let app = create_test_app(None);
+    let app = create_capturing_app(None).await;
+    let client = create_client();
 
-    let request = Request::builder()
-        .uri("/test")
-        .method("CUSTOM_METHOD") // Non-standard method
-        .header("X-Custom-Protocol", "value") // Non-standard header
-        .body(Body::empty())
+    client
+        .request(
+            reqwest::Method::from_bytes(b"CUSTOM_METHOD").unwrap(),
+            format!("http://{}/test", app.proxy_addr),
+        )
+        .header("X-Custom-Protocol", "value")
+        .send()
+        .await
         .unwrap();
 
-    let response = app.clone().oneshot(request).await.unwrap();
-
-    // Unknown elements should be forwarded
-    assert!(response.headers().contains_key("x-custom-protocol"));
+    let upstream_headers = app.upstream_received_headers().await;
+    assert!(upstream_headers.contains_key("x-custom-protocol"));
 }
 
 #[tokio::test]
