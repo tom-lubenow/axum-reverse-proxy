@@ -115,7 +115,8 @@ where
     }
 
     fn call(&mut self, req: axum::http::Request<Body>) -> Self::Future {
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
         let attempts = self.attempts;
         let delay = self.delay;
         Box::pin(async move {
