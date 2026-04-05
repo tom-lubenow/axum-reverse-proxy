@@ -29,6 +29,7 @@ tokio-native-tls = { version = "^0.3", optional = true }
 tokio-tungstenite = "^0.28"
 tower = { version = "^0.5", features = ["full"] }
 tracing = "^0.1"
+percent-encoding = "^2.3"
 url = "^2.5"
 hickory-resolver = { version = "0.25.2", optional = true }
 rand = "0.9.1"
