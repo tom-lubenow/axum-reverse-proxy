@@ -157,9 +157,6 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
     // Build the request
     let request = request.body(())?;
 
-    // Log the request headers
-    trace!("Upstream request headers: {:?}", request.headers());
-
     // Connect to upstream WebSocket BEFORE returning 101 to the client.
     // This ensures we only tell the client the upgrade succeeded if the
     // upstream actually accepted the WebSocket connection.

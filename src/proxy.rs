@@ -116,7 +116,6 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
         req: axum::http::Request<Body>,
     ) -> Result<axum::http::Response<Body>, Infallible> {
         trace!("Proxying request method={} uri={}", req.method(), req.uri());
-        trace!("Original headers headers={:?}", req.headers());
 
         // Transform the URI to the upstream target
         let path_q = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("");
