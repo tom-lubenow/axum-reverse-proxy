@@ -82,7 +82,6 @@ where
         req.method(),
         upstream_uri
     );
-    trace!("Original headers: {:?}", req.headers());
 
     // Check if this is a WebSocket upgrade request
     if websocket::is_websocket_upgrade(req.headers()) {
@@ -116,15 +115,12 @@ where
         builder.body(body).unwrap()
     };
 
-    trace!("Forwarding headers: {:?}", forward_req.headers());
-
     // Send the request
     match client.request(forward_req).await {
         Ok(res) => {
             trace!(
-                "Received response status={} headers={:?} version={:?}",
+                "Received response status={} version={:?}",
                 res.status(),
-                res.headers(),
                 res.version()
             );
 
