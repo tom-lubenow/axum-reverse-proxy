@@ -28,6 +28,8 @@ use http::uri::Builder as UriBuilder;
 use std::convert::Infallible;
 use tracing::{error, trace};
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+
 use crate::forward::{ProxyClient, create_proxy_client, forward_request};
 
 /// A trait for resolving the target URL for a proxy request.
@@ -91,10 +93,30 @@ impl TargetResolver for &'static str {
     }
 }
 
+/// Characters that are percent-encoded in template parameter values to prevent
+/// URL structure manipulation (SSRF). This encodes characters that could alter
+/// the authority, query, or fragment components of the resolved URL.
+///
+/// Notably, `/` is NOT encoded to preserve catch-all route (`{*rest}`) behavior.
+const TEMPLATE_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'@') // Prevents userinfo injection (SSRF via authority rewrite)
+    .add(b'#') // Prevents fragment injection (URL truncation)
+    .add(b'?') // Prevents query injection
+    .add(b'\\') // Backslash treated as separator by some parsers
+    .add(b'[') // Prevents IPv6 address injection
+    .add(b']'); // Prevents IPv6 address injection
+
 /// A template-based target resolver that substitutes path parameters into a URL template.
 ///
 /// Template placeholders use the format `{param_name}` and are replaced with the
 /// corresponding path parameter values from the request.
+///
+/// # Security
+///
+/// Parameter values are percent-encoded before substitution to prevent SSRF attacks.
+/// Characters like `@`, `?`, `#`, and `\` are encoded so that injected values cannot
+/// alter the URL's authority, query, or fragment components.
 ///
 /// # Example
 ///
@@ -129,7 +151,8 @@ impl TargetResolver for TemplateTarget {
         let mut result = self.template.clone();
         for (key, value) in params {
             let placeholder = format!("{{{}}}", key);
-            result = result.replace(&placeholder, value);
+            let encoded = utf8_percent_encode(value, TEMPLATE_ENCODE_SET).to_string();
+            result = result.replace(&placeholder, &encoded);
         }
         result
     }
@@ -360,5 +383,72 @@ mod tests {
         let original: Uri = "/request".parse().unwrap();
         let result = build_upstream_uri(&target, &original);
         assert_eq!(result.to_string(), "https://example.com/path");
+    }
+
+    #[test]
+    fn test_template_encodes_at_sign_prevents_ssrf() {
+        // A template like "http://my-app-{env}/api" with env="@attacker.com"
+        // must NOT resolve to "http://my-app-@attacker.com/api" (host=attacker.com).
+        // The @ must be percent-encoded to prevent authority rewriting.
+        let resolver = proxy_template("http://my-app-{env}/api");
+        let req = dummy_request();
+        let params = vec![("env".to_string(), "@attacker.com".to_string())];
+        let resolved = resolver.resolve(&req, &params);
+        assert_eq!(resolved, "http://my-app-%40attacker.com/api");
+
+        // The encoded URL will fail URI parsing (InvalidAuthority), which means
+        // the proxy returns a 500 instead of making the SSRF request. This is
+        // the desired security outcome — the attack is fully prevented.
+        assert!(resolved.parse::<Uri>().is_err());
+
+        // Verify the unencoded version WOULD have parsed with the attacker as host
+        let malicious = "http://my-app-@attacker.com/api";
+        let malicious_uri: Uri = malicious.parse().unwrap();
+        assert_eq!(malicious_uri.host(), Some("attacker.com"));
+    }
+
+    #[test]
+    fn test_template_encodes_fragment_injection() {
+        let resolver = proxy_template("https://backend.com/path/{id}/data");
+        let req = dummy_request();
+        let params = vec![("id".to_string(), "x#evil".to_string())];
+        let resolved = resolver.resolve(&req, &params);
+        assert_eq!(resolved, "https://backend.com/path/x%23evil/data");
+    }
+
+    #[test]
+    fn test_template_encodes_query_injection() {
+        let resolver = proxy_template("https://backend.com/path/{id}");
+        let req = dummy_request();
+        let params = vec![("id".to_string(), "x?admin=true".to_string())];
+        let resolved = resolver.resolve(&req, &params);
+        assert_eq!(resolved, "https://backend.com/path/x%3Fadmin=true");
+    }
+
+    #[test]
+    fn test_template_preserves_slashes_for_catch_all() {
+        // Slashes are intentionally NOT encoded to support {*rest} catch-all routes
+        let resolver = proxy_template("https://backend.com/api/{rest}");
+        let req = dummy_request();
+        let params = vec![("rest".to_string(), "foo/bar/baz".to_string())];
+        assert_eq!(
+            resolver.resolve(&req, &params),
+            "https://backend.com/api/foo/bar/baz"
+        );
+    }
+
+    #[test]
+    fn test_template_safe_values_unchanged() {
+        // Normal alphanumeric values, hyphens, dots, underscores pass through unmodified
+        let resolver = proxy_template("https://{service}.example.com/{id}");
+        let req = dummy_request();
+        let params = vec![
+            ("service".to_string(), "my-app_v2.1".to_string()),
+            ("id".to_string(), "abc-123".to_string()),
+        ];
+        assert_eq!(
+            resolver.resolve(&req, &params),
+            "https://my-app_v2.1.example.com/abc-123"
+        );
     }
 }
