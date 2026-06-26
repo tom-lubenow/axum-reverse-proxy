@@ -6,7 +6,9 @@ use axum::{
     http::{Request, StatusCode},
     routing::get,
 };
-use axum_reverse_proxy::{ProxyRouterExt, TargetResolver, proxy_template};
+use axum_reverse_proxy::{
+    HostBehaviour, ProxyPolicy, ProxyRouterExt, TargetResolver, proxy_template,
+};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
@@ -23,6 +25,13 @@ async fn create_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         }))
         .route("/api/{*rest}", get(|axum::extract::Path(rest): axum::extract::Path<String>| async move {
             format!("api:{}", rest)
+        }))
+        .route("/echo-host", get(|req: Request<Body>| async move {
+            req.headers()
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string()
         }));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -253,4 +262,57 @@ async fn test_multiple_proxy_routes() {
         .await
         .unwrap();
     assert_eq!(&body2[..], b"video:vid001:1080p");
+}
+
+#[tokio::test]
+async fn proxy_route_with_preserve_policy_forwards_client_host() {
+    let (backend_addr, _handle) = create_backend().await;
+    let target = format!("http://{backend_addr}/echo-host");
+
+    let app: Router = Router::new().proxy_route_with_policy(
+        "/echo-host",
+        target,
+        ProxyPolicy {
+            host_behaviour: HostBehaviour::Preserve,
+        },
+    );
+
+    let req = Request::builder()
+        .uri("/echo-host")
+        .header("host", "client.example.com")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    // Preserve behaviour: the client's host reaches the backend unchanged.
+    assert_eq!(&body[..], b"client.example.com");
+}
+
+#[tokio::test]
+async fn proxy_route_with_default_policy_replaces_host_with_upstream_authority() {
+    let (backend_addr, _handle) = create_backend().await;
+    let target = format!("http://{backend_addr}/echo-host");
+
+    // The plain `proxy_route` defaults to Replace; assert the backend sees its
+    // own authority rather than the client-supplied host.
+    let app: Router = Router::new().proxy_route("/echo-host", target);
+
+    let req = Request::builder()
+        .uri("/echo-host")
+        .header("host", "client.example.com")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], backend_addr.to_string().as_bytes());
 }

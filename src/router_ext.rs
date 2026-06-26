@@ -28,9 +28,11 @@ use http::uri::Builder as UriBuilder;
 use std::convert::Infallible;
 use tracing::{error, trace};
 
+use crate::{
+    forward::{ProxyClient, create_proxy_client, forward_request},
+    proxy::ProxyPolicy,
+};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-
-use crate::forward::{ProxyClient, create_proxy_client, forward_request};
 
 /// A trait for resolving the target URL for a proxy request.
 ///
@@ -208,14 +210,37 @@ pub trait ProxyRouterExt<S> {
     ///     // Dynamic proxy with path substitution
     ///     .proxy_route("/users/{id}", proxy_template("https://users.example.com/{id}"));
     /// ```
-    fn proxy_route<T: TargetResolver>(self, path: &str, target: T) -> Self;
+    fn proxy_route<T: TargetResolver>(self, path: &str, target: T) -> Self
+    where
+        Self: Sized,
+    {
+        self.proxy_route_with_policy(path, target, ProxyPolicy::default())
+    }
+
+    /// Add a proxy route with an explicit [`ProxyPolicy`].
+    ///
+    /// Identical to [`proxy_route`](Self::proxy_route) but lets the caller
+    /// override forwarding behaviour (e.g. preserving the client's `Host`
+    /// header). [`proxy_route`](Self::proxy_route) is the [`ProxyPolicy::default`]
+    /// case of this method.
+    fn proxy_route_with_policy<T: TargetResolver>(
+        self,
+        path: &str,
+        target: T,
+        policy: ProxyPolicy,
+    ) -> Self;
 }
 
 impl<S> ProxyRouterExt<S> for Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    fn proxy_route<T: TargetResolver>(self, path: &str, target: T) -> Self {
+    fn proxy_route_with_policy<T: TargetResolver>(
+        self,
+        path: &str,
+        target: T,
+        policy: ProxyPolicy,
+    ) -> Self {
         let client = create_proxy_client();
 
         self.route(
@@ -224,7 +249,8 @@ where
                 move |Path(params): Path<Vec<(String, String)>>, req: Request<Body>| {
                     let target = target.clone();
                     let client = client.clone();
-                    async move { proxy_request(target, params, req, client).await }
+                    let policy = policy.clone();
+                    async move { proxy_request(target, params, req, client, &policy).await }
                 },
             ),
         )
@@ -236,6 +262,7 @@ async fn proxy_request<T: TargetResolver>(
     params: Vec<(String, String)>,
     req: Request<Body>,
     client: ProxyClient,
+    policy: &ProxyPolicy,
 ) -> Result<Response<Body>, Infallible> {
     let target_url = target.resolve(&req, &params);
     trace!("Proxying request to resolved target: {}", target_url);
@@ -256,7 +283,7 @@ async fn proxy_request<T: TargetResolver>(
     let upstream_uri = build_upstream_uri(&target_uri, req.uri());
 
     // Use shared forwarding logic
-    forward_request(upstream_uri, req, &client).await
+    forward_request(upstream_uri, req, &client, policy).await
 }
 
 /// Build the upstream URI from the target and original request.

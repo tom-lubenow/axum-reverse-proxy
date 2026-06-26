@@ -11,7 +11,7 @@ use hyper_util::client::legacy::{Client, connect::Connect, connect::HttpConnecto
 use std::convert::Infallible;
 use tracing::{error, trace};
 
-use crate::websocket;
+use crate::{proxy::ProxyPolicy, websocket};
 
 #[cfg(all(feature = "tls", not(feature = "native-tls")))]
 pub(crate) type ProxyClient = Client<HttpsConnector<HttpConnector>, Body>;
@@ -73,6 +73,7 @@ pub(crate) async fn forward_request<C>(
     upstream_uri: Uri,
     req: Request<Body>,
     client: &Client<C, Body>,
+    policy: &ProxyPolicy,
 ) -> Result<Response<Body>, Infallible>
 where
     C: Connect + Clone + Send + Sync + 'static,
@@ -86,7 +87,7 @@ where
     // Check if this is a WebSocket upgrade request
     if websocket::is_websocket_upgrade(req.headers()) {
         trace!("Detected WebSocket upgrade request");
-        match websocket::handle_websocket_with_upstream_uri(req, upstream_uri).await {
+        match websocket::handle_websocket_with_upstream_uri(req, upstream_uri, policy).await {
             Ok(response) => return Ok(response),
             Err(e) => {
                 error!("Failed to handle WebSocket upgrade: {}", e);
@@ -104,9 +105,10 @@ where
             .method(req.method().clone())
             .uri(upstream_uri);
 
-        // Forward headers (except host, which will be set by the client)
+        // Forward headers. When the policy replaces the host, drop the client's
+        // host so the hyper client backfills it from the upstream authority.
         for (key, value) in req.headers() {
-            if key != "host" {
+            if key != "host" || policy.forwards_client_host() {
                 builder = builder.header(key, value);
             }
         }

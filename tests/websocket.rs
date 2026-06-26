@@ -390,3 +390,114 @@ async fn test_websocket_ping_pong() {
         }
     }
 }
+
+/// Upstream WebSocket handler that reports every `host` header value it
+/// received on the upgrade handshake over a channel, then echoes frames.
+async fn ws_host_capture_handler(
+    ws: WebSocketUpgrade,
+    State(tx): State<tokio::sync::mpsc::Sender<Vec<String>>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let hosts: Vec<String> = headers
+        .get_all("host")
+        .iter()
+        .map(|v| v.to_str().unwrap_or_default().to_string())
+        .collect();
+    let _ = tx.send(hosts).await;
+    ws.on_upgrade(handle_socket)
+}
+
+/// Stand up a host-capturing upstream and a proxy with `policy`, returning
+/// (upstream_addr, proxy_addr, host receiver).
+async fn setup_ws_host_policy_proxy(
+    policy: axum_reverse_proxy::ProxyPolicy,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    tokio::sync::mpsc::Receiver<Vec<String>>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<String>>(1);
+    let app = Router::new()
+        .route("/ws", get(ws_host_capture_handler))
+        .with_state(tx);
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(upstream_listener, app).await.unwrap();
+    });
+
+    let proxy = ReverseProxy::new("/", &format!("http://{upstream_addr}")).with_policy(policy);
+    let proxy_app: Router = proxy.into();
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    (upstream_addr, proxy_addr, rx)
+}
+
+/// Connect to the proxy with an explicit client `Host` header and return the
+/// host header values the upstream saw on the handshake.
+async fn upstream_ws_hosts_seen(
+    proxy_addr: SocketAddr,
+    client_host: &str,
+    rx: &mut tokio::sync::mpsc::Receiver<Vec<String>>,
+) -> Vec<String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let url = format!("ws://127.0.0.1:{}/ws", proxy_addr.port());
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("host", client_host.parse().unwrap());
+
+    let (_ws, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("ws connect via proxy");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("no host captured before timeout")
+        .expect("host channel closed")
+}
+
+#[tokio::test]
+async fn websocket_host_header_with_default_policy_replaces_host_with_upstream_authority() {
+    use axum_reverse_proxy::ProxyPolicy;
+
+    let (upstream_addr, proxy_addr, mut rx) =
+        setup_ws_host_policy_proxy(ProxyPolicy::default()).await;
+
+    let hosts = upstream_ws_hosts_seen(proxy_addr, "client.example.com", &mut rx).await;
+
+    // Exactly one Host header (regression guard against duplicate emission)...
+    assert_eq!(
+        hosts.len(),
+        1,
+        "expected exactly one host header, got {hosts:?}"
+    );
+    // ...set to the upstream authority under the default Replace behaviour.
+    assert_eq!(hosts[0], upstream_addr.to_string());
+}
+
+#[tokio::test]
+async fn websocket_host_header_with_preserve_policy_forwards_single_client_host() {
+    use axum_reverse_proxy::{HostBehaviour, ProxyPolicy};
+
+    let policy = ProxyPolicy {
+        host_behaviour: HostBehaviour::Preserve,
+    };
+    let (_upstream_addr, proxy_addr, mut rx) = setup_ws_host_policy_proxy(policy).await;
+
+    let hosts = upstream_ws_hosts_seen(proxy_addr, "client.example.com", &mut rx).await;
+
+    // Still exactly one Host header — Preserve must not also append the
+    // upstream authority, which would emit a duplicate.
+    assert_eq!(
+        hosts.len(),
+        1,
+        "expected exactly one host header, got {hosts:?}"
+    );
+    assert_eq!(hosts[0], "client.example.com");
+}
