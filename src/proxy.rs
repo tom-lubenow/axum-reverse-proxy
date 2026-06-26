@@ -20,7 +20,7 @@ pub struct ReverseProxy<C: Connect + Clone + Send + Sync + 'static> {
     policy: ProxyPolicy,
 }
 
-/// Behavioural knobs applied to every request a [`ReverseProxy`] forwards.
+/// Proxy route and behavioural config to every request a [`ReverseProxy`] forwards.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProxyPolicy {
     /// How the upstream `Host` header is derived. See [`HostBehaviour`].
