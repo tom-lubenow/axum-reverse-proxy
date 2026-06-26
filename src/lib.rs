@@ -325,7 +325,7 @@ pub use danger::create_dangerous_native_tls_connector;
 pub use danger::create_dangerous_rustls_config;
 #[cfg(feature = "dns")]
 pub use dns_discovery::{DnsDiscovery, DnsDiscoveryConfig, StaticDnsDiscovery};
-pub use proxy::ReverseProxy;
+pub use proxy::{HostBehaviour, ProxyPolicy, ReverseProxy};
 pub use retry::RetryLayer;
 pub use rfc9110::{Rfc9110Config, Rfc9110Layer};
 pub use router_ext::{ProxyRouterExt, TargetResolver, TemplateTarget, proxy_template};

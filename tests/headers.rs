@@ -1,8 +1,8 @@
 use axum::{Router, body::Body, http::Request, response::Json, routing::get};
-use axum_reverse_proxy::ReverseProxy;
+use axum_reverse_proxy::{HostBehaviour, ProxyPolicy, ReverseProxy};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::Notify};
 
 async fn echo_headers(req: Request<Body>) -> Json<Value> {
@@ -207,4 +207,74 @@ async fn test_proxy_special_headers() {
         }
         Err(_) => panic!("Test timed out after 10 seconds"),
     }
+}
+
+/// Spin up an echo-headers upstream and a proxy configured with `policy`,
+/// returning (upstream_addr, proxy_addr). Both servers are spawned as
+/// background tasks that live for the duration of the test process.
+async fn setup_host_policy_proxy(policy: ProxyPolicy) -> (SocketAddr, SocketAddr) {
+    let app = Router::new().route("/headers", get(echo_headers));
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(upstream_listener, app).await.unwrap();
+    });
+
+    let proxy = ReverseProxy::new("/", &format!("http://{upstream_addr}")).with_policy(policy);
+    let proxy_app: Router = proxy.into();
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    (upstream_addr, proxy_addr)
+}
+
+/// Send a request through the proxy with an explicit `Host` header and return
+/// the `host` value the upstream echoed back.
+async fn upstream_host_seen(proxy_addr: SocketAddr, client_host: &str) -> String {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let body: Value = client
+        .get(format!("http://{proxy_addr}/headers"))
+        .header(reqwest::header::HOST, client_host)
+        .send()
+        .await
+        .expect("request to proxy failed")
+        .json()
+        .await
+        .expect("response was not json");
+
+    body["headers"]["host"]
+        .as_str()
+        .expect("upstream did not echo a host header")
+        .to_string()
+}
+
+#[tokio::test]
+async fn host_header_with_default_policy_replaces_host_with_upstream_authority() {
+    let (upstream_addr, proxy_addr) = setup_host_policy_proxy(ProxyPolicy::default()).await;
+
+    let seen = upstream_host_seen(proxy_addr, "client.example.com").await;
+
+    // Default (Replace) behaviour: upstream sees its own authority, not the
+    // client-supplied host.
+    assert_eq!(seen, upstream_addr.to_string());
+}
+
+#[tokio::test]
+async fn host_header_with_preserve_policy_forwards_client_host() {
+    let policy = ProxyPolicy {
+        host_behaviour: HostBehaviour::Preserve,
+    };
+    let (_upstream_addr, proxy_addr) = setup_host_policy_proxy(policy).await;
+
+    let seen = upstream_host_seen(proxy_addr, "client.example.com").await;
+
+    // Preserve behaviour: the client's original host flows through unchanged.
+    assert_eq!(seen, "client.example.com");
 }

@@ -17,6 +17,56 @@ pub struct ReverseProxy<C: Connect + Clone + Send + Sync + 'static> {
     path: String,
     target: String,
     client: Client<C, Body>,
+    policy: ProxyPolicy,
+}
+
+/// Behavioural knobs applied to every request a [`ReverseProxy`] forwards.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProxyPolicy {
+    /// How the upstream `Host` header is derived. See [`HostBehaviour`].
+    pub host_behaviour: HostBehaviour,
+}
+
+impl ProxyPolicy {
+    /// Whether the client's original `Host` header is forwarded upstream rather
+    /// than replaced with the upstream authority
+    pub(crate) fn forwards_client_host(&self) -> bool {
+        matches!(self.host_behaviour, HostBehaviour::Preserve)
+    }
+
+    /// Resolve the single `Host` header value to send upstream, given the
+    /// client's request headers and the upstream authority to fall back to.
+    ///
+    /// Under [`HostBehaviour::Preserve`] this is the client's `Host`, falling
+    /// back to `upstream_authority` when the client sent none (e.g. an HTTP/2
+    /// client whose `:authority` is not surfaced as a `Host` header). Otherwise
+    /// it is always `upstream_authority`.
+    pub(crate) fn forwarded_host(
+        &self,
+        client_headers: &http::HeaderMap,
+        upstream_authority: String,
+    ) -> String {
+        if self.forwards_client_host() {
+            client_headers
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+                .unwrap_or(upstream_authority)
+        } else {
+            upstream_authority
+        }
+    }
+}
+
+/// Controls the value of the `Host` header sent to the upstream server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HostBehaviour {
+    /// Forward the client's original `Host` header unchanged.
+    Preserve,
+    /// Replace `Host` with the upstream target's authority (the default, and
+    /// the behaviour of every prior release).
+    #[default]
+    Replace,
 }
 
 pub type StandardReverseProxy = ReverseProxy<ProxyConnector>;
@@ -89,7 +139,15 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
             path: path.into(),
             target: target.into(),
             client,
+            policy: ProxyPolicy::default(),
         }
+    }
+
+    /// Apply a [`ProxyPolicy`] to this proxy, overriding the default behaviour.
+    #[must_use]
+    pub fn with_policy(mut self, policy: ProxyPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Get the base path this proxy is configured to handle
@@ -123,7 +181,7 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
         let upstream_uri = self.transform_uri(path_q);
 
         // Use shared forwarding logic
-        forward_request(upstream_uri, req, &self.client).await
+        forward_request(upstream_uri, req, &self.client, &self.policy).await
     }
 
     /// Transform an incoming request path+query into the target URI using http::Uri builder
@@ -265,7 +323,49 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::StandardReverseProxy as ReverseProxy;
+    use super::{HostBehaviour, ProxyPolicy, StandardReverseProxy as ReverseProxy};
+
+    fn headers_with_host(host: Option<&str>) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        if let Some(host) = host {
+            headers.insert(http::header::HOST, host.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn upstream_host_with_replace_policy_uses_upstream_authority() {
+        let policy = ProxyPolicy::default();
+        let headers = headers_with_host(Some("client.example.com"));
+        assert_eq!(
+            policy.forwarded_host(&headers, "upstream:8080".to_string()),
+            "upstream:8080"
+        );
+    }
+
+    #[test]
+    fn upstream_host_with_preserve_policy_uses_client_host() {
+        let policy = ProxyPolicy {
+            host_behaviour: HostBehaviour::Preserve,
+        };
+        let headers = headers_with_host(Some("client.example.com"));
+        assert_eq!(
+            policy.forwarded_host(&headers, "upstream:8080".to_string()),
+            "client.example.com"
+        );
+    }
+
+    #[test]
+    fn upstream_host_with_preserve_policy_and_no_client_host_falls_back_to_authority() {
+        let policy = ProxyPolicy {
+            host_behaviour: HostBehaviour::Preserve,
+        };
+        let headers = headers_with_host(None);
+        assert_eq!(
+            policy.forwarded_host(&headers, "upstream:8080".to_string()),
+            "upstream:8080"
+        );
+    }
 
     #[test]
     fn transform_uri_with_and_without_trailing_slash() {

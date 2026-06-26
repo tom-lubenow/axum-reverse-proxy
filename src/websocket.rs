@@ -10,10 +10,15 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Error, Message, handshake::derive_accept_key},
+    tungstenite::{
+        Error, Message,
+        handshake::{self, derive_accept_key},
+    },
 };
 use tracing::{error, trace};
 use url::{Host, Url};
+
+use crate::proxy::ProxyPolicy;
 
 /// Check if a request is a WebSocket upgrade request by examining the headers.
 ///
@@ -103,6 +108,7 @@ fn compute_host_header(url: &str) -> (String, u16) {
 pub(crate) async fn handle_websocket_with_upstream_uri(
     req: Request<Body>,
     upstream_http_uri: Uri,
+    policy: &ProxyPolicy,
 ) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
     trace!("Handling WebSocket upgrade request");
 
@@ -141,17 +147,19 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
     let url = Url::parse(&upstream_url)?;
     let (host_header, _port) = compute_host_header_from_url(&url);
 
-    // Forward all headers except host and sec-websocket-extensions to upstream.
-    // Extensions are stripped because the proxy performs frame-level forwarding and
-    // cannot transparently handle negotiated extensions (e.g. permessage-deflate).
-    let mut request = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
-        .uri(upstream_url)
-        .header("host", host_header);
+    let upstream_host = policy.forwarded_host(req.headers(), host_header);
 
+    let mut request = handshake::client::Request::builder()
+        .uri(upstream_url)
+        .header("host", upstream_host);
+
+    // sec-websocket-extensions is stripped because the proxy forwards frames
+    // verbatim and cannot honour negotiated extensions (e.g. permessage-deflate).
     for (key, value) in req.headers() {
-        if key != "host" && key != "sec-websocket-extensions" {
-            request = request.header(key.as_str(), value);
+        if key == "host" || key == "sec-websocket-extensions" {
+            continue;
         }
+        request = request.header(key.as_str(), value);
     }
 
     // Build the request
