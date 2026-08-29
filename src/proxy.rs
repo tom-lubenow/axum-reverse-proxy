@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 use tracing::trace;
 
-use crate::forward::{ProxyConnector, create_http_connector, forward_request};
+use crate::forward::{ProxyConnector, forward_request};
 
 /// A reverse proxy that forwards HTTP requests to an upstream server.
 ///
@@ -66,6 +66,12 @@ pub struct ProxyPolicy {
     /// chunked) is cut off, failing the upstream request. Default: `None`
     /// (unlimited).
     pub max_request_body_bytes: Option<u64>,
+    /// Pseudonym for `Via` header emission (RFC 9110 §7.6.3). When set, the
+    /// proxy appends `<protocol-version> <pseudonym>` to the `Via` header of
+    /// forwarded requests and returned responses, and answers
+    /// `508 Loop Detected` when its own pseudonym already appears in an
+    /// incoming request's `Via` chain. Default: `None` (no Via handling).
+    pub via: Option<String>,
 }
 
 impl Default for ProxyPolicy {
@@ -77,6 +83,7 @@ impl Default for ProxyPolicy {
             public_scheme: None,
             upstream_timeout: None,
             max_request_body_bytes: None,
+            via: None,
         }
     }
 }
@@ -129,6 +136,15 @@ impl ProxyPolicy {
     #[must_use]
     pub fn with_max_request_body_bytes(mut self, max: u64) -> Self {
         self.max_request_body_bytes = Some(max);
+        self
+    }
+
+    /// Enable `Via` header emission and loop detection under the given
+    /// pseudonym (RFC 9110 §7.6.3). A request whose `Via` chain already
+    /// contains this pseudonym is answered with `508 Loop Detected`.
+    #[must_use]
+    pub fn with_via(mut self, pseudonym: impl Into<String>) -> Self {
+        self.via = Some(pseudonym.into());
         self
     }
 
@@ -221,14 +237,7 @@ impl StandardReverseProxy {
         P: Into<String>,
         T: Into<String>,
     {
-        let client = Client::builder(hyper_util::rt::TokioExecutor::new())
-            .pool_idle_timeout(std::time::Duration::from_secs(60))
-            .pool_max_idle_per_host(32)
-            .retry_canceled_requests(true)
-            .set_host(true)
-            .build(create_http_connector());
-
-        Self::new_with_client(path, target, client)
+        Self::new_with_client(path, target, crate::forward::create_proxy_client())
     }
 }
 

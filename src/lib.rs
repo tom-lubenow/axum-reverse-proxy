@@ -335,5 +335,6 @@ pub use dns_discovery::{DnsDiscovery, DnsDiscoveryConfig, StaticDnsDiscovery};
 pub use forward::ProxyError;
 pub use proxy::{HostBehaviour, ProxyPolicy, ReverseProxy, XForwardedFor};
 pub use retry::RetryLayer;
+#[allow(deprecated)]
 pub use rfc9110::{Rfc9110Config, Rfc9110Layer};
 pub use router_ext::{ProxyRouterExt, TargetResolver, TemplateTarget, proxy_template};

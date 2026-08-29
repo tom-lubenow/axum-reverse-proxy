@@ -1,3 +1,4 @@
+#![allow(deprecated)] // impls of the deprecated types below
 //! RFC9110 (HTTP Semantics) Compliance Layer
 //!
 //! This module implements middleware for RFC9110 compliance, focusing on:
@@ -115,6 +116,10 @@ fn parse_via_header(header: &str) -> Vec<ViaEntry> {
 
 /// Configuration for RFC9110 middleware
 #[derive(Clone, Debug)]
+#[deprecated(
+    since = "2.2.0",
+    note = "hop-by-hop header stripping has been core proxy behaviour since 2.0, and Via emission plus loop detection are available via `ProxyPolicy::with_via`. Max-Forwards/TRACE handling has no replacement — copy this layer into your project if you rely on it. The layer will be removed in 3.0."
+)]
 pub struct Rfc9110Config {
     /// Server names to check for loop detection
     pub server_names: Option<HashSet<String>>,
@@ -142,6 +147,10 @@ impl Default for Rfc9110Config {
 
 /// Layer that applies RFC9110 middleware
 #[derive(Clone)]
+#[deprecated(
+    since = "2.2.0",
+    note = "hop-by-hop header stripping has been core proxy behaviour since 2.0, and Via emission plus loop detection are available via `ProxyPolicy::with_via`. Max-Forwards/TRACE handling has no replacement — copy this layer into your project if you rely on it. The layer will be removed in 3.0."
+)]
 pub struct Rfc9110Layer {
     config: Rfc9110Config,
 }
@@ -179,6 +188,10 @@ impl<S> Layer<S> for Rfc9110Layer {
 
 /// RFC9110 middleware service
 #[derive(Clone)]
+#[deprecated(
+    since = "2.2.0",
+    note = "hop-by-hop header stripping has been core proxy behaviour since 2.0, and Via emission plus loop detection are available via `ProxyPolicy::with_via`. Max-Forwards/TRACE handling has no replacement — copy this layer into your project if you rely on it. The layer will be removed in 3.0."
+)]
 pub struct Rfc9110<S> {
     inner: S,
     config: Rfc9110Config,

@@ -25,7 +25,7 @@ This is a **library, not a proxy server**. It deliberately does not compete with
 - 🧰 Custom client configuration support
 - 🔒 HTTPS support with HTTP/1.1 and HTTP/2 (ALPN) upstreams
 - 📦 Response trailers preserved (gRPC-compatible)
-- 📋 Optional RFC9110 compliance layer (Via headers, Max-Forwards, loop detection)
+- 📋 Optional `Via` header emission and loop detection (RFC 9110 §7.6.3)
 - 🔧 Full Tower middleware support
 
 ## Installation
@@ -88,9 +88,7 @@ let dns_config = DnsDiscoveryConfig::new("api.example.com", 443)
     .with_refresh_interval(Duration::from_secs(30));
 let discovery = DnsDiscovery::new(dns_config).unwrap();
 
-let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-    .build(hyper_util::client::legacy::connect::HttpConnector::new());
-let proxy = DiscoverableBalancedProxy::new_with_client("/api", client, discovery);
+let proxy = DiscoverableBalancedProxy::new("/api", discovery);
 proxy.start_discovery().await;
 
 let app: Router = Router::new().nest_service("/", proxy);
@@ -116,6 +114,8 @@ let policy = ProxyPolicy::new()
     .with_upstream_timeout(Duration::from_secs(30))
     // 413 for request bodies larger than 10 MiB
     .with_max_request_body_bytes(10 * 1024 * 1024)
+    // Emit Via headers and answer 508 on request loops
+    .with_via("my-proxy")
     // Upstream WebSocket connect timeout (default 5s)
     .with_websocket_connect_timeout(Duration::from_secs(10));
 
@@ -233,35 +233,22 @@ let app: Router<AppState> = Router::new()
 
 ## RFC9110 Compliance
 
-The library includes an optional RFC9110 compliance layer that implements key requirements from [RFC9110 (HTTP Semantics)](https://www.rfc-editor.org/rfc/rfc9110.html). To use it:
+Hop-by-hop header handling (RFC 9110 §7.6.1) is core proxy behaviour — no
+layer needed. `Via` header emission and loop detection are enabled with one
+policy call:
 
 ```rust
-use axum_reverse_proxy::{ReverseProxy, Rfc9110Config, Rfc9110Layer};
-use std::collections::HashSet;
+use axum_reverse_proxy::{ProxyPolicy, ReverseProxy};
 
-// Create a config for RFC9110 compliance
-let mut server_names = HashSet::new();
-server_names.insert("example.com".to_string());
-
-let config = Rfc9110Config {
-    server_names: Some(server_names),  // For loop detection
-    pseudonym: Some("myproxy".to_string()),  // For Via headers
-    combine_via: true,  // Combine Via headers with same protocol
-    preserve_websocket_headers: true,  // Preserve WebSocket upgrade headers
-};
-
-// Create a proxy with RFC9110 compliance
 let proxy = ReverseProxy::new("/api", "https://api.example.com")
-    .layer(Rfc9110Layer::with_config(config));
+    .with_policy(ProxyPolicy::new().with_via("my-proxy"));
+// Forwarded requests and responses carry "Via: 1.1 my-proxy";
+// a request whose Via chain already contains "my-proxy" gets 508 Loop Detected.
 ```
 
-The RFC9110 layer provides:
-
-- **Connection Header Processing**: Properly handles Connection headers and removes hop-by-hop headers
-- **Via Header Management**: Adds and combines Via headers according to spec
-- **Max-Forwards Processing**: Handles Max-Forwards header for TRACE/OPTIONS methods
-- **Loop Detection**: Detects request loops using Via headers and server names
-- **End-to-end Header Preservation**: Preserves end-to-end headers while removing hop-by-hop headers
+The standalone `Rfc9110Layer` is **deprecated** (removal in 3.0): its useful
+parts now live in the core proxy as described above. If you rely on its
+Max-Forwards/TRACE handling, copy the layer into your project.
 
 ### Custom Client Configuration
 

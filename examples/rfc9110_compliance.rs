@@ -1,3 +1,4 @@
+#![allow(deprecated)] // exercises the deprecated Rfc9110Layer until its removal in 3.0
 use axum::{
     Router,
     routing::{get, post},

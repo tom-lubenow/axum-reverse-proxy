@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tower::discover::{Change, Discover};
 use tracing::{debug, error, trace, warn};
 
-use crate::forward::{ProxyConnector, create_http_connector};
+use crate::forward::{ProxyConnector, create_proxy_client};
 use crate::proxy::{ProxyPolicy, ReverseProxy};
 
 use rand::Rng;
@@ -39,14 +39,7 @@ impl StandardBalancedProxy {
     where
         S: Into<String> + Clone,
     {
-        let client = Client::builder(hyper_util::rt::TokioExecutor::new())
-            .pool_idle_timeout(std::time::Duration::from_secs(60))
-            .pool_max_idle_per_host(32)
-            .retry_canceled_requests(true)
-            .set_host(true)
-            .build(create_http_connector());
-
-        Self::new_with_client(path, targets, client)
+        Self::new_with_client(path, targets, create_proxy_client())
     }
 }
 
@@ -180,6 +173,32 @@ where
 }
 
 pub type StandardDiscoverableBalancedProxy<D> = DiscoverableBalancedProxy<ProxyConnector, D>;
+
+impl<D> StandardDiscoverableBalancedProxy<D>
+where
+    D: Discover + Clone + Send + Sync + 'static,
+    D::Service: Into<String> + Send,
+    D::Key: Clone + std::fmt::Debug + Send + Sync + std::hash::Hash,
+    D::Error: std::fmt::Debug + Send,
+{
+    /// Creates a discoverable balanced proxy with the crate's standard HTTP
+    /// client (connection pooling, TLS per enabled features). Uses
+    /// round-robin load balancing.
+    pub fn new<S>(path: S, discover: D) -> Self
+    where
+        S: Into<String>,
+    {
+        Self::new_with_client(path, create_proxy_client(), discover)
+    }
+
+    /// Like [`new`](Self::new) but with an explicit load balancing strategy.
+    pub fn new_with_strategy<S>(path: S, discover: D, strategy: LoadBalancingStrategy) -> Self
+    where
+        S: Into<String>,
+    {
+        Self::new_with_client_and_strategy(path, create_proxy_client(), discover, strategy)
+    }
+}
 
 impl<C, D> DiscoverableBalancedProxy<C, D>
 where

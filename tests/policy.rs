@@ -204,3 +204,31 @@ async fn connect_method_is_rejected_with_501() {
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
 }
+
+/// `Expect: 100-continue` requests must pass through the proxy without
+/// hanging and deliver the full body (the header is end-to-end and is
+/// forwarded; hyper handles the interim response mechanics on each hop).
+#[tokio::test]
+async fn expect_100_continue_passthrough() {
+    let upstream = Router::new().route(
+        "/upload",
+        axum::routing::post(|body: String| async move { format!("got {} bytes", body.len()) }),
+    );
+    let proxy_addr = serve_proxy(upstream, ProxyPolicy::default(), false).await;
+
+    let client = reqwest::Client::new();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("http://{proxy_addr}/upload"))
+            .header("Expect", "100-continue")
+            .body("x".repeat(2048))
+            .send(),
+    )
+    .await
+    .expect("request with Expect: 100-continue hung")
+    .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "got 2048 bytes");
+}

@@ -146,6 +146,52 @@ fn hop_by_hop_headers(headers: &HeaderMap) -> HashSet<HeaderName> {
     strip
 }
 
+/// Protocol version string for `Via` header entries (RFC 9110 §7.6.3).
+fn via_protocol(version: http::Version) -> &'static str {
+    match version {
+        http::Version::HTTP_09 => "0.9",
+        http::Version::HTTP_10 => "1.0",
+        http::Version::HTTP_11 => "1.1",
+        http::Version::HTTP_2 => "2.0",
+        http::Version::HTTP_3 => "3.0",
+        _ => "1.1",
+    }
+}
+
+/// Whether any element of the `Via` chain carries the given pseudonym,
+/// indicating the request has passed through this proxy before.
+fn via_contains_pseudonym(headers: &HeaderMap, pseudonym: &str) -> bool {
+    headers
+        .get_all(http::header::VIA)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|element| {
+            let mut parts = element.split_whitespace();
+            // element = <protocol> <pseudonym> [comment]
+            parts.next().is_some() && parts.next() == Some(pseudonym)
+        })
+}
+
+/// Append this proxy's `<protocol> <pseudonym>` element to the `Via` header.
+fn append_via(headers: &mut HeaderMap, version: http::Version, pseudonym: &str) {
+    let own = format!("{} {}", via_protocol(version), pseudonym);
+    let existing: Vec<String> = headers
+        .get_all(http::header::VIA)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .collect();
+    let combined = if existing.is_empty() {
+        own
+    } else {
+        format!("{}, {}", existing.join(", "), own)
+    };
+    if let Ok(value) = HeaderValue::from_str(&combined) {
+        headers.insert(http::header::VIA, value);
+    }
+}
+
 /// Strip hop-by-hop headers from a response's header map in place.
 fn strip_hop_by_hop_response_headers(headers: &mut HeaderMap) {
     for name in hop_by_hop_headers(headers) {
@@ -312,6 +358,17 @@ where
             .unwrap());
     }
 
+    // Loop detection (RFC 9110 §7.3): a request whose Via chain already
+    // carries our pseudonym has been through this proxy before.
+    if let Some(pseudonym) = &policy.via
+        && via_contains_pseudonym(req.headers(), pseudonym)
+    {
+        return Ok(Response::builder()
+            .status(StatusCode::LOOP_DETECTED)
+            .body(Body::from("Loop Detected"))
+            .unwrap());
+    }
+
     // Enforce the request body cap early when the client declared a length.
     if let Some(max) = policy.max_request_body_bytes
         && let Some(declared) = req
@@ -354,7 +411,10 @@ where
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0);
     let client_authority = parts.uri.authority().map(|a| a.as_str());
-    let headers = build_forward_headers(&parts.headers, client_addr, client_authority, policy);
+    let mut headers = build_forward_headers(&parts.headers, client_addr, client_authority, policy);
+    if let Some(pseudonym) = &policy.via {
+        append_via(&mut headers, parts.version, pseudonym);
+    }
 
     // Cap streaming bodies (no declared length) mid-flight; an oversized body
     // fails the upstream request rather than being forwarded truncated.
@@ -404,6 +464,9 @@ where
 
             let (mut parts, body) = res.into_parts();
             strip_hop_by_hop_response_headers(&mut parts.headers);
+            if let Some(pseudonym) = &policy.via {
+                append_via(&mut parts.headers, parts.version, pseudonym);
+            }
 
             // Wrap the upstream body directly (rather than as a data stream)
             // so trailer frames survive — gRPC needs them.

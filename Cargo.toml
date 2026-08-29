@@ -1,6 +1,6 @@
 [package]
 name = "axum-reverse-proxy"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A flexible and efficient reverse proxy implementation for Axum web applications"

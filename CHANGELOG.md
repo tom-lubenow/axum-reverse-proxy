@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-08-28
+
+### Added
+
+- `ProxyPolicy::with_via(pseudonym)` — core `Via` header emission
+  (RFC 9110 §7.6.3) on forwarded requests and returned responses, plus
+  pseudonym-based loop detection answering `508 Loop Detected`. This replaces
+  the useful part of the now-deprecated `Rfc9110Layer`.
+- `DiscoverableBalancedProxy::new` and `new_with_strategy` convenience
+  constructors using the crate's standard HTTP client — previously a client
+  always had to be built by hand (the README even showed a constructor that
+  didn't exist).
+- `docs/DESIGN.md` — decision records, including why the custom P2C balancer
+  is retained instead of adopting `tower::balance` (readiness-model mismatch;
+  the selection math has been unit-tested since 2.1).
+- Regression test verifying `Expect: 100-continue` requests pass through the
+  proxy without hanging and with the full body delivered.
+
+### Deprecated
+
+- `Rfc9110Layer`, `Rfc9110Config` (removal in 3.0). Hop-by-hop stripping has
+  been core behaviour since 2.0; Via emission and loop detection are now
+  `ProxyPolicy::with_via`. Max-Forwards/TRACE handling has no replacement —
+  copy the layer into your project if you rely on it.
+
 ## [2.1.0] - 2026-08-28
 
 This release repositions the project (see the rewritten README: a library for
