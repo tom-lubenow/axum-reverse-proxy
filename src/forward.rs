@@ -154,10 +154,11 @@ fn strip_hop_by_hop_response_headers(headers: &mut HeaderMap) {
 }
 
 /// Build the header map to send upstream: client headers minus hop-by-hop
-/// headers, with `Host` and `X-Forwarded-*` handled per policy.
+/// headers, with `Host` and `X-Forwarded-*` / `Forwarded` handled per policy.
 fn build_forward_headers(
     client_headers: &HeaderMap,
     client_addr: Option<SocketAddr>,
+    client_authority: Option<&str>,
     policy: &ProxyPolicy,
 ) -> HeaderMap {
     let strip = hop_by_hop_headers(client_headers);
@@ -175,35 +176,111 @@ fn build_forward_headers(
         headers.append(key.clone(), value.clone());
     }
 
-    if policy.x_forwarded_for == XForwardedFor::Append
-        && let Some(addr) = client_addr
+    // An HTTP/2 client carries its host in `:authority` (the URI), not a
+    // `Host` header. Under Preserve, materialize it so the upstream sees it.
+    if policy.forwards_client_host()
+        && !headers.contains_key(http::header::HOST)
+        && let Some(authority) = client_authority
+        && let Ok(value) = HeaderValue::from_str(authority)
     {
-        let client_ip = addr.ip().to_string();
-        let x_forwarded_for = HeaderName::from_static("x-forwarded-for");
-        let existing: Vec<String> = headers
-            .get_all(&x_forwarded_for)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .map(str::to_owned)
-            .collect();
-        let combined = if existing.is_empty() {
-            client_ip
-        } else {
-            format!("{}, {}", existing.join(", "), client_ip)
-        };
-        if let Ok(value) = HeaderValue::from_str(&combined) {
-            headers.insert(x_forwarded_for, value);
+        headers.insert(http::header::HOST, value);
+    }
+
+    if policy.x_forwarded_for == XForwardedFor::Append {
+        let x_forwarded_host = HeaderName::from_static("x-forwarded-host");
+        let client_host = client_headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or(client_authority);
+
+        if let Some(addr) = client_addr {
+            let client_ip = addr.ip().to_string();
+            let x_forwarded_for = HeaderName::from_static("x-forwarded-for");
+            let existing: Vec<String> = headers
+                .get_all(&x_forwarded_for)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .map(str::to_owned)
+                .collect();
+            let combined = if existing.is_empty() {
+                client_ip
+            } else {
+                format!("{}, {}", existing.join(", "), client_ip)
+            };
+            if let Ok(value) = HeaderValue::from_str(&combined) {
+                headers.insert(x_forwarded_for, value);
+            }
+
+            append_forwarded_header(
+                &mut headers,
+                addr,
+                client_host,
+                policy.public_scheme.as_deref(),
+            );
         }
 
-        let x_forwarded_host = HeaderName::from_static("x-forwarded-host");
         if !headers.contains_key(&x_forwarded_host)
-            && let Some(host) = client_headers.get(http::header::HOST)
+            && let Some(host) = client_host
+            && let Ok(value) = HeaderValue::from_str(host)
         {
-            headers.insert(x_forwarded_host, host.clone());
+            headers.insert(x_forwarded_host, value);
+        }
+
+        let x_forwarded_proto = HeaderName::from_static("x-forwarded-proto");
+        if !headers.contains_key(&x_forwarded_proto)
+            && let Some(scheme) = &policy.public_scheme
+            && let Ok(value) = HeaderValue::from_str(scheme)
+        {
+            headers.insert(x_forwarded_proto, value);
         }
     }
 
     headers
+}
+
+/// Append this proxy's element to the RFC 7239 `Forwarded` header.
+///
+/// The element always carries `for=`; `host=` and `proto=` (when known) are
+/// included only on the first element, since they describe the original
+/// request and a later proxy in the chain is not its first recipient.
+fn append_forwarded_header(
+    headers: &mut HeaderMap,
+    client_addr: SocketAddr,
+    client_host: Option<&str>,
+    public_scheme: Option<&str>,
+) {
+    let for_value = match client_addr.ip() {
+        std::net::IpAddr::V4(ip) => format!("for={ip}"),
+        // IPv6 node identifiers must be bracketed and quoted (RFC 7239 §6.1).
+        std::net::IpAddr::V6(ip) => format!("for=\"[{ip}]\""),
+    };
+
+    let forwarded = HeaderName::from_static("forwarded");
+    let existing: Vec<String> = headers
+        .get_all(&forwarded)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .collect();
+
+    let mut element = for_value;
+    if existing.is_empty() {
+        if let Some(host) = client_host {
+            element.push_str(&format!(";host=\"{host}\""));
+        }
+        if let Some(scheme) = public_scheme {
+            element.push_str(&format!(";proto={scheme}"));
+        }
+    }
+
+    let combined = if existing.is_empty() {
+        element
+    } else {
+        format!("{}, {}", existing.join(", "), element)
+    };
+    if let Ok(value) = HeaderValue::from_str(&combined) {
+        headers.insert(forwarded, value);
+    }
 }
 
 /// Forward a request to the given upstream URI.
@@ -225,6 +302,30 @@ where
         req.method(),
         upstream_uri
     );
+
+    // CONNECT establishes a tunnel; a reverse proxy has no meaningful way to
+    // forward it to a fixed upstream. Reject it explicitly.
+    if req.method() == http::Method::CONNECT {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_IMPLEMENTED)
+            .body(Body::from("CONNECT is not supported"))
+            .unwrap());
+    }
+
+    // Enforce the request body cap early when the client declared a length.
+    if let Some(max) = policy.max_request_body_bytes
+        && let Some(declared) = req
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+        && declared > max
+    {
+        return Ok(Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .body(Body::from("Payload Too Large"))
+            .unwrap());
+    }
 
     // Check if this is a WebSocket upgrade request
     if websocket::is_websocket_upgrade(req.headers()) {
@@ -252,7 +353,15 @@ where
         .extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0);
-    let headers = build_forward_headers(&parts.headers, client_addr, policy);
+    let client_authority = parts.uri.authority().map(|a| a.as_str());
+    let headers = build_forward_headers(&parts.headers, client_addr, client_authority, policy);
+
+    // Cap streaming bodies (no declared length) mid-flight; an oversized body
+    // fails the upstream request rather than being forwarded truncated.
+    let body = match policy.max_request_body_bytes {
+        Some(max) => Body::new(http_body_util::Limited::new(body, max as usize)),
+        None => body,
+    };
 
     let mut forward_req = Request::builder()
         .method(parts.method.clone())
@@ -261,8 +370,31 @@ where
         .unwrap();
     *forward_req.headers_mut() = headers;
 
-    // Send the request
-    match client.request(forward_req).await {
+    // Send the request, optionally bounded by the upstream response-header
+    // deadline.
+    let result = match policy.upstream_timeout {
+        Some(deadline) => match tokio::time::timeout(deadline, client.request(forward_req)).await {
+            Ok(result) => result,
+            Err(_) => {
+                error!(
+                    "Upstream did not return response headers within {:?}",
+                    deadline
+                );
+                let mut response = Response::builder()
+                    .status(StatusCode::GATEWAY_TIMEOUT)
+                    .body(Body::from("Gateway Timeout"))
+                    .unwrap();
+                response.extensions_mut().insert(ProxyError {
+                    message: format!("upstream response headers timed out after {deadline:?}"),
+                    is_connect: false,
+                });
+                return Ok(response);
+            }
+        },
+        None => client.request(forward_req).await,
+    };
+
+    match result {
         Ok(res) => {
             trace!(
                 "Received response status={} version={:?}",
@@ -337,7 +469,7 @@ mod tests {
             ("x-internal", "secret"),
             ("x-app", "value"),
         ]);
-        let forwarded = build_forward_headers(&client_headers, None, &ProxyPolicy::default());
+        let forwarded = build_forward_headers(&client_headers, None, None, &ProxyPolicy::default());
         assert!(!forwarded.contains_key("connection"));
         assert!(!forwarded.contains_key("keep-alive"));
         assert!(!forwarded.contains_key("x-internal"));
@@ -347,11 +479,11 @@ mod tests {
     #[test]
     fn preserves_te_trailers_for_grpc() {
         let client_headers = headers(&[("te", "trailers"), ("content-type", "application/grpc")]);
-        let forwarded = build_forward_headers(&client_headers, None, &ProxyPolicy::default());
+        let forwarded = build_forward_headers(&client_headers, None, None, &ProxyPolicy::default());
         assert_eq!(forwarded.get("te").unwrap(), "trailers");
 
         let client_headers = headers(&[("te", "gzip")]);
-        let forwarded = build_forward_headers(&client_headers, None, &ProxyPolicy::default());
+        let forwarded = build_forward_headers(&client_headers, None, None, &ProxyPolicy::default());
         assert!(!forwarded.contains_key("te"));
     }
 
@@ -359,7 +491,8 @@ mod tests {
     fn appends_client_ip_to_x_forwarded_for() {
         let client_headers = headers(&[("x-forwarded-for", "10.0.0.1"), ("host", "example.com")]);
         let addr: SocketAddr = "192.168.1.5:12345".parse().unwrap();
-        let forwarded = build_forward_headers(&client_headers, Some(addr), &ProxyPolicy::default());
+        let forwarded =
+            build_forward_headers(&client_headers, Some(addr), None, &ProxyPolicy::default());
         assert_eq!(
             forwarded.get("x-forwarded-for").unwrap(),
             "10.0.0.1, 192.168.1.5"
@@ -372,19 +505,89 @@ mod tests {
         let client_headers = headers(&[("x-forwarded-for", "10.0.0.1")]);
         let addr: SocketAddr = "192.168.1.5:12345".parse().unwrap();
         let policy = ProxyPolicy::new().with_x_forwarded_for(XForwardedFor::Preserve);
-        let forwarded = build_forward_headers(&client_headers, Some(addr), &policy);
+        let forwarded = build_forward_headers(&client_headers, Some(addr), None, &policy);
         assert_eq!(forwarded.get("x-forwarded-for").unwrap(), "10.0.0.1");
         assert!(!forwarded.contains_key("x-forwarded-host"));
     }
 
     #[test]
+    fn sets_x_forwarded_proto_from_public_scheme() {
+        let client_headers = headers(&[("host", "example.com")]);
+        let addr: SocketAddr = "192.168.1.5:12345".parse().unwrap();
+        let policy = ProxyPolicy::new().with_public_scheme("https");
+        let forwarded = build_forward_headers(&client_headers, Some(addr), None, &policy);
+        assert_eq!(forwarded.get("x-forwarded-proto").unwrap(), "https");
+
+        // An existing X-Forwarded-Proto is not overwritten
+        let client_headers = headers(&[("x-forwarded-proto", "http")]);
+        let forwarded = build_forward_headers(&client_headers, Some(addr), None, &policy);
+        assert_eq!(forwarded.get("x-forwarded-proto").unwrap(), "http");
+    }
+
+    #[test]
+    fn appends_rfc7239_forwarded_element() {
+        // First proxy in the chain: element carries for/host/proto
+        let client_headers = headers(&[("host", "example.com")]);
+        let addr: SocketAddr = "192.168.1.5:12345".parse().unwrap();
+        let policy = ProxyPolicy::new().with_public_scheme("https");
+        let forwarded = build_forward_headers(&client_headers, Some(addr), None, &policy);
+        assert_eq!(
+            forwarded.get("forwarded").unwrap(),
+            "for=192.168.1.5;host=\"example.com\";proto=https"
+        );
+
+        // Later proxy: only for= is appended to the existing header
+        let client_headers = headers(&[
+            ("host", "example.com"),
+            (
+                "forwarded",
+                "for=10.0.0.1;host=\"orig.example\";proto=https",
+            ),
+        ]);
+        let forwarded = build_forward_headers(&client_headers, Some(addr), None, &policy);
+        assert_eq!(
+            forwarded.get("forwarded").unwrap(),
+            "for=10.0.0.1;host=\"orig.example\";proto=https, for=192.168.1.5"
+        );
+    }
+
+    #[test]
+    fn forwarded_quotes_ipv6_addresses() {
+        let client_headers = headers(&[]);
+        let addr: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let forwarded =
+            build_forward_headers(&client_headers, Some(addr), None, &ProxyPolicy::default());
+        assert_eq!(forwarded.get("forwarded").unwrap(), "for=\"[2001:db8::1]\"");
+    }
+
+    #[test]
+    fn preserve_mode_materializes_h2_authority_as_host() {
+        // HTTP/2 requests carry the host in :authority (the URI), not a Host
+        // header; Preserve mode must still forward it.
+        let client_headers = headers(&[]);
+        let policy = ProxyPolicy::new().with_host_behaviour(HostBehaviour::Preserve);
+        let forwarded =
+            build_forward_headers(&client_headers, None, Some("client.example.com"), &policy);
+        assert_eq!(forwarded.get("host").unwrap(), "client.example.com");
+
+        // Replace mode still drops it
+        let forwarded = build_forward_headers(
+            &client_headers,
+            None,
+            Some("client.example.com"),
+            &ProxyPolicy::default(),
+        );
+        assert!(!forwarded.contains_key("host"));
+    }
+
+    #[test]
     fn host_dropped_unless_preserved() {
         let client_headers = headers(&[("host", "client.example.com")]);
-        let forwarded = build_forward_headers(&client_headers, None, &ProxyPolicy::default());
+        let forwarded = build_forward_headers(&client_headers, None, None, &ProxyPolicy::default());
         assert!(!forwarded.contains_key("host"));
 
         let policy = ProxyPolicy::new().with_host_behaviour(HostBehaviour::Preserve);
-        let forwarded = build_forward_headers(&client_headers, None, &policy);
+        let forwarded = build_forward_headers(&client_headers, None, None, &policy);
         assert_eq!(forwarded.get("host").unwrap(), "client.example.com");
     }
 }

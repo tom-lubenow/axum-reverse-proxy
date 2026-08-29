@@ -50,6 +50,22 @@ pub struct ProxyPolicy {
     /// How long to wait when establishing an upstream WebSocket connection
     /// before failing the client's upgrade request. Default: 5 seconds.
     pub websocket_connect_timeout: Duration,
+    /// The scheme (`http`/`https`) this proxy is publicly served over, used
+    /// for `X-Forwarded-Proto` and the `proto=` directive of the `Forwarded`
+    /// header under [`XForwardedFor::Append`]. The proxy cannot reliably
+    /// detect this itself (TLS is typically terminated in front of or beside
+    /// it), so it must be declared. Default: `None` (proto is not set).
+    pub public_scheme: Option<String>,
+    /// Maximum time to wait for the upstream's response *headers* before
+    /// answering `504 Gateway Timeout`. Response bodies stream without a
+    /// deadline. Default: `None` (no timeout).
+    pub upstream_timeout: Option<Duration>,
+    /// Maximum request body size in bytes. Requests declaring a larger
+    /// `Content-Length` are rejected with `413 Payload Too Large` without
+    /// contacting the upstream; a body that exceeds the cap mid-stream (e.g.
+    /// chunked) is cut off, failing the upstream request. Default: `None`
+    /// (unlimited).
+    pub max_request_body_bytes: Option<u64>,
 }
 
 impl Default for ProxyPolicy {
@@ -58,6 +74,9 @@ impl Default for ProxyPolicy {
             host_behaviour: HostBehaviour::default(),
             x_forwarded_for: XForwardedFor::default(),
             websocket_connect_timeout: Duration::from_secs(5),
+            public_scheme: None,
+            upstream_timeout: None,
+            max_request_body_bytes: None,
         }
     }
 }
@@ -89,6 +108,30 @@ impl ProxyPolicy {
         self
     }
 
+    /// Declare the scheme (`"http"` or `"https"`) this proxy is publicly
+    /// served over, enabling `X-Forwarded-Proto` and `proto=` in `Forwarded`.
+    #[must_use]
+    pub fn with_public_scheme(mut self, scheme: impl Into<String>) -> Self {
+        self.public_scheme = Some(scheme.into());
+        self
+    }
+
+    /// Set a deadline for receiving the upstream's response headers; on
+    /// expiry the client gets `504 Gateway Timeout`.
+    #[must_use]
+    pub fn with_upstream_timeout(mut self, timeout: Duration) -> Self {
+        self.upstream_timeout = Some(timeout);
+        self
+    }
+
+    /// Cap the request body size in bytes (`413 Payload Too Large` for larger
+    /// declared bodies; mid-stream cutoff for chunked bodies that exceed it).
+    #[must_use]
+    pub fn with_max_request_body_bytes(mut self, max: u64) -> Self {
+        self.max_request_body_bytes = Some(max);
+        self
+    }
+
     /// Whether the client's original `Host` header is forwarded upstream rather
     /// than replaced with the upstream authority
     pub(crate) fn forwards_client_host(&self) -> bool {
@@ -96,15 +139,17 @@ impl ProxyPolicy {
     }
 
     /// Resolve the single `Host` header value to send upstream, given the
-    /// client's request headers and the upstream authority to fall back to.
+    /// client's request headers, the request URI's authority (the HTTP/2
+    /// `:authority`, surfaced there rather than as a `Host` header), and the
+    /// upstream authority to fall back to.
     ///
-    /// Under [`HostBehaviour::Preserve`] this is the client's `Host`, falling
-    /// back to `upstream_authority` when the client sent none (e.g. an HTTP/2
-    /// client whose `:authority` is not surfaced as a `Host` header). Otherwise
-    /// it is always `upstream_authority`.
+    /// Under [`HostBehaviour::Preserve`] this is the client's `Host`, then the
+    /// client's `:authority`, then `upstream_authority`. Otherwise it is
+    /// always `upstream_authority`.
     pub(crate) fn forwarded_host(
         &self,
         client_headers: &http::HeaderMap,
+        client_authority: Option<&str>,
         upstream_authority: String,
     ) -> String {
         if self.forwards_client_host() {
@@ -112,6 +157,7 @@ impl ProxyPolicy {
                 .get(http::header::HOST)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned)
+                .or_else(|| client_authority.map(str::to_owned))
                 .unwrap_or(upstream_authority)
         } else {
             upstream_authority
@@ -401,7 +447,7 @@ mod tests {
         let policy = ProxyPolicy::default();
         let headers = headers_with_host(Some("client.example.com"));
         assert_eq!(
-            policy.forwarded_host(&headers, "upstream:8080".to_string()),
+            policy.forwarded_host(&headers, None, "upstream:8080".to_string()),
             "upstream:8080"
         );
     }
@@ -411,7 +457,7 @@ mod tests {
         let policy = ProxyPolicy::new().with_host_behaviour(HostBehaviour::Preserve);
         let headers = headers_with_host(Some("client.example.com"));
         assert_eq!(
-            policy.forwarded_host(&headers, "upstream:8080".to_string()),
+            policy.forwarded_host(&headers, None, "upstream:8080".to_string()),
             "client.example.com"
         );
     }
@@ -421,7 +467,7 @@ mod tests {
         let policy = ProxyPolicy::new().with_host_behaviour(HostBehaviour::Preserve);
         let headers = headers_with_host(None);
         assert_eq!(
-            policy.forwarded_host(&headers, "upstream:8080".to_string()),
+            policy.forwarded_host(&headers, None, "upstream:8080".to_string()),
             "upstream:8080"
         );
     }
@@ -518,5 +564,102 @@ mod tests {
             proxy_with_slash.transform_uri("/test/something"),
             "http://target/api/something"
         );
+    }
+
+    mod properties {
+        use super::ReverseProxy;
+        use proptest::prelude::*;
+
+        /// Valid URI path segments (no percent-encoding needed).
+        fn path_strategy() -> impl Strategy<Value = String> {
+            proptest::collection::vec("[a-zA-Z0-9._~-]{1,8}", 0..5).prop_flat_map(|segs| {
+                proptest::bool::ANY.prop_map(move |trailing| {
+                    let mut p = String::new();
+                    for s in &segs {
+                        p.push('/');
+                        p.push_str(s);
+                    }
+                    if p.is_empty() || trailing {
+                        p.push('/');
+                    }
+                    p
+                })
+            })
+        }
+
+        fn base_strategy() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("/".to_string()),
+                Just("/api".to_string()),
+                Just("/api/".to_string()),
+                Just("/api/v1".to_string()),
+                "/[a-z]{1,6}".prop_map(|s| s),
+            ]
+        }
+
+        fn query_strategy() -> impl Strategy<Value = Option<String>> {
+            proptest::option::of("[a-zA-Z0-9=&_-]{0,16}")
+        }
+
+        proptest! {
+            /// For any valid base path, target path, and request path+query,
+            /// transform_uri must not panic and must preserve the target's
+            /// scheme and authority and the request's query verbatim.
+            #[test]
+            fn transform_uri_preserves_scheme_authority_and_query(
+                base in base_strategy(),
+                target_path in path_strategy(),
+                req_path in path_strategy(),
+                query in query_strategy(),
+            ) {
+                let target = format!("http://target{target_path}");
+                let proxy = ReverseProxy::new(base, target);
+
+                let pq = match &query {
+                    Some(q) => format!("{req_path}?{q}"),
+                    None => req_path.clone(),
+                };
+                let uri = proxy.transform_uri(&pq);
+
+                prop_assert_eq!(uri.scheme_str(), Some("http"));
+                prop_assert_eq!(uri.authority().map(|a| a.as_str()), Some("target"));
+                prop_assert!(uri.path().starts_with('/'), "path was {:?}", uri.path());
+                prop_assert_eq!(uri.query(), query.as_deref());
+            }
+
+            /// When the request path extends the base path at a segment
+            /// boundary, the upstream path is exactly the target base path
+            /// plus the remainder.
+            #[test]
+            fn transform_uri_strips_base_at_boundary(
+                target_path in path_strategy(),
+                rest in proptest::collection::vec("[a-zA-Z0-9._~-]{1,8}", 1..4),
+            ) {
+                let target = format!("http://target{target_path}");
+                let proxy = ReverseProxy::new("/api".to_string(), target);
+
+                let remainder: String = rest.iter().map(|s| format!("/{s}")).collect();
+                let uri = proxy.transform_uri(&format!("/api{remainder}"));
+
+                let target_base = if target_path == "/" {
+                    String::new()
+                } else {
+                    target_path.trim_end_matches('/').to_string()
+                };
+                prop_assert_eq!(uri.path(), format!("{target_base}{remainder}"));
+            }
+
+            /// Similar prefixes must never be stripped: /apiary is not under
+            /// /api.
+            #[test]
+            fn transform_uri_never_strips_similar_prefixes(
+                suffix in "[a-zA-Z0-9]{1,8}",
+            ) {
+                let proxy = ReverseProxy::new("/api", "http://target");
+                let path = format!("/api{suffix}");
+                let uri = proxy.transform_uri(&path);
+                prop_assert_eq!(uri.path(), path.as_str());
+            }
+        }
     }
 }

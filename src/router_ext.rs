@@ -636,4 +636,48 @@ mod tests {
             "https://my-app_v2.1.example.com/abc-123"
         );
     }
+
+    mod properties {
+        use super::super::{build_upstream_uri, strip_route_prefix};
+        use axum::http::Uri;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Joining a base target with any remaining path must preserve
+            /// scheme/authority and never panic or double slashes.
+            #[test]
+            fn build_upstream_uri_joins_cleanly(
+                target_path in prop_oneof![
+                    Just("".to_string()),
+                    Just("/".to_string()),
+                    Just("/v2".to_string()),
+                    Just("/v2/".to_string()),
+                ],
+                segs in proptest::collection::vec("[a-zA-Z0-9._~-]{1,8}", 0..4),
+            ) {
+                let target: Uri = format!("https://backend{target_path}").parse().unwrap();
+                let original: Uri = "/req".parse().unwrap();
+                let rest: String = segs.iter().map(|s| format!("/{s}")).collect();
+                let append = if rest.is_empty() { None } else { Some(rest.as_str()) };
+
+                let uri = build_upstream_uri(&target, &original, append).unwrap();
+                prop_assert_eq!(uri.scheme_str(), Some("https"));
+                prop_assert_eq!(uri.authority().map(|a| a.as_str()), Some("backend"));
+                prop_assert!(!uri.path().contains("//"), "path was {:?}", uri.path());
+                if let Some(rest) = append {
+                    prop_assert!(uri.path().ends_with(rest));
+                }
+            }
+
+            /// Prefix stripping only happens at segment boundaries.
+            #[test]
+            fn strip_route_prefix_respects_boundaries(suffix in "[a-zA-Z0-9]{1,8}") {
+                let joined = format!("/api{suffix}");
+                prop_assert_eq!(strip_route_prefix(&joined, "/api"), joined.as_str());
+                let nested = format!("/api/{suffix}");
+                let expected = format!("/{suffix}");
+                prop_assert_eq!(strip_route_prefix(&nested, "/api"), expected.as_str());
+            }
+        }
+    }
 }

@@ -56,3 +56,40 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: nix develop --command cargo fmt --all -- --check
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - run: cargo check --features full --all-targets
+
+  features:
+    name: Feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: No default features (no TLS)
+        run: nix develop --command cargo check --no-default-features
+      - name: native-tls only
+        run: nix develop --command cargo check --no-default-features --features native-tls
+      - name: dns only
+        run: nix develop --command cargo check --no-default-features --features dns
+      - name: tls + native-tls (native-tls precedence)
+        run: nix develop --command cargo check --features native-tls
+      - name: full
+        run: nix develop --command cargo check --features full
+
+  semver:
+    name: Semver checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: default-features

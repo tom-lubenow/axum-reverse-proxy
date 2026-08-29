@@ -4,16 +4,21 @@
 [![crates.io](https://img.shields.io/crates/v/axum-reverse-proxy.svg)](https://crates.io/crates/axum-reverse-proxy)
 [![Documentation](https://docs.rs/axum-reverse-proxy/badge.svg)](https://docs.rs/axum-reverse-proxy)
 
-A flexible and efficient reverse proxy implementation for [Axum](https://github.com/tokio-rs/axum) web applications. This library provides a simple way to forward HTTP requests from your Axum application to upstream servers. It is intended to be a simple implementation sitting on top of axum and hyper.
+The boring, correct reverse-proxy building block for [Axum](https://github.com/tokio-rs/axum) applications.
 
-The eventual goal would be to benchmark ourselves against common reverse proxy libraries like nginx, traefik, haproxy, etc. We hope to achieve comparable (or better) performance but with significantly better developer ergonomics, using Rust code to configure the proxy instead of various configuration files with their own DSLs.
+You already have an axum app; this crate lets it also proxy things — a backend-for-frontend, a strangler-fig migration of a legacy service, a dev server fronting another process, a small internal gateway where the routing logic is Rust code instead of a config DSL. Hand-rolling this with a hyper client is 50 lines for the happy path; this crate exists to get the long tail right for you: WebSocket upgrades, hop-by-hop header stripping, `X-Forwarded-*`, trailers (gRPC), safe retries, and load balancing.
+
+## Scope
+
+This is a **library, not a proxy server**. It deliberately does not compete with nginx, HAProxy, Envoy, or [Pingora](https://github.com/cloudflare/pingora) at the network edge — if you need an internet-facing proxy with DDoS hardening, graceful reloads, and an ops ecosystem, use one of those. Correspondingly out of scope: config-file formats, health checking, circuit breaking, and outlier detection. In scope: everything a proxy embedded in an axum app needs to be *correct* and safe by default.
 
 ## Features
 
 - 🛣 Path-based routing
 - 🔄 Optional retry mechanism (replays only requests that never reached the upstream)
 - 📨 Header forwarding with hop-by-hop headers stripped per RFC 9110 (`te: trailers` preserved for gRPC)
-- 🌐 `X-Forwarded-For` / `X-Forwarded-Host` support
+- 🌐 `X-Forwarded-For` / `X-Forwarded-Host` / `X-Forwarded-Proto` and RFC 7239 `Forwarded` support
+- ⏱ Optional upstream response timeout and request body size cap
 - ⚙ Configurable HTTP client settings
 - 🔀 Round-robin and P2C load balancing across multiple upstreams
 - 🔌 Easy integration with Axum's Router
@@ -104,6 +109,13 @@ let policy = ProxyPolicy::new()
     .with_host_behaviour(HostBehaviour::Preserve)
     // Leave X-Forwarded-For untouched (default is Append)
     .with_x_forwarded_for(XForwardedFor::Preserve)
+    // Declare the public scheme, enabling X-Forwarded-Proto and
+    // proto= in the RFC 7239 Forwarded header
+    .with_public_scheme("https")
+    // 504 if the upstream doesn't return response headers in time
+    .with_upstream_timeout(Duration::from_secs(30))
+    // 413 for request bodies larger than 10 MiB
+    .with_max_request_body_bytes(10 * 1024 * 1024)
     // Upstream WebSocket connect timeout (default 5s)
     .with_websocket_connect_timeout(Duration::from_secs(10));
 
@@ -322,6 +334,19 @@ Check out the [examples](examples/) directory for more usage examples:
 - [Retry Proxy](examples/retry.rs) - Demonstrates enabling retries via `RetryLayer`
 - [Balanced Proxy](examples/balanced.rs) - Forward to multiple upstream servers with round-robin load balancing
 - **Note:** very large requests may still need buffering depending on the body wrapper's strategy.
+
+## Performance
+
+Interposing the proxy costs on the order of **~11 µs per request** on loopback
+(criterion, see [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for numbers, method,
+and the caveats that come with loopback microbenchmarks). For requests that
+touch a real network, the proxy's contribution is noise.
+
+## Minimum Supported Rust Version
+
+The MSRV is declared in `Cargo.toml` (`rust-version = "1.88"`) and verified in
+CI. Bumping it is considered a minor (not breaking) change, in line with
+ecosystem convention.
 
 ## Development
 

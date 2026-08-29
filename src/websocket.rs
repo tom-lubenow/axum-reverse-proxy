@@ -147,7 +147,9 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
     let url = Url::parse(&upstream_url)?;
     let (host_header, _port) = compute_host_header_from_url(&url);
 
-    let upstream_host = policy.forwarded_host(req.headers(), host_header);
+    let client_authority = req.uri().authority().map(|a| a.as_str().to_owned());
+    let upstream_host =
+        policy.forwarded_host(req.headers(), client_authority.as_deref(), host_header);
 
     let mut request = handshake::client::Request::builder()
         .uri(upstream_url)

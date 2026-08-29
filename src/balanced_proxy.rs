@@ -522,3 +522,93 @@ impl ServiceMetrics {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper_util::client::legacy::connect::HttpConnector;
+
+    fn endpoint(pending: usize, ewma_micros: u64) -> Endpoint<HttpConnector> {
+        let client =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpConnector::new());
+        let metrics = ServiceMetrics::new();
+        metrics.pending_requests.store(pending, Ordering::Relaxed);
+        metrics
+            .peak_ewma_micros
+            .store(ewma_micros, Ordering::Relaxed);
+        Endpoint {
+            proxy: ReverseProxy::new_with_client("/", "http://127.0.0.1:1", client),
+            metrics: Arc::new(metrics),
+        }
+    }
+
+    #[test]
+    fn p2c_single_endpoint_is_always_selected() {
+        let endpoints = vec![endpoint(100, 0)];
+        assert_eq!(
+            p2c_select(&endpoints, LoadBalancingStrategy::P2cPendingRequests),
+            0
+        );
+    }
+
+    #[test]
+    fn p2c_pending_requests_prefers_less_loaded_endpoint() {
+        // With exactly two endpoints, P2C always compares both, so the choice
+        // is deterministic: the endpoint with fewer pending requests wins.
+        let endpoints = vec![endpoint(10, 0), endpoint(0, 0)];
+        for _ in 0..100 {
+            assert_eq!(
+                p2c_select(&endpoints, LoadBalancingStrategy::P2cPendingRequests),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn p2c_peak_ewma_prefers_lower_latency_endpoint() {
+        let endpoints = vec![endpoint(0, 500_000), endpoint(0, 1_000)];
+        for _ in 0..100 {
+            assert_eq!(
+                p2c_select(&endpoints, LoadBalancingStrategy::P2cPeakEwma),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn pending_request_guard_decrements_on_drop() {
+        let metrics = Arc::new(ServiceMetrics::new());
+        metrics.pending_requests.fetch_add(1, Ordering::Relaxed);
+        {
+            let _guard = PendingRequestGuard {
+                metrics: Arc::clone(&metrics),
+            };
+            assert_eq!(metrics.pending_requests.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(metrics.pending_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn ewma_first_measurement_sets_latency_directly() {
+        let metrics = ServiceMetrics::new();
+        metrics.update_ewma(Duration::from_millis(50));
+        assert_eq!(
+            metrics.peak_ewma_micros.load(Ordering::Relaxed),
+            50_000,
+            "first measurement should be recorded as-is"
+        );
+    }
+
+    #[test]
+    fn ewma_load_decays_over_time() {
+        let metrics = ServiceMetrics::new();
+        metrics.peak_ewma_micros.store(100_000, Ordering::Relaxed);
+        *metrics.last_update.lock().unwrap() = Instant::now() - Duration::from_secs(10);
+        let load = metrics.load(LoadBalancingStrategy::P2cPeakEwma);
+        // ~50% decay every 5s => after 10s the load should be well below half
+        assert!(
+            load < 20_000,
+            "expected decayed load well below stored value, got {load}"
+        );
+    }
+}

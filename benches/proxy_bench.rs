@@ -172,8 +172,36 @@ fn bench_large_payload(c: &mut Criterion) {
     group.finish();
 }
 
+/// Baseline: the same GET served directly by the test server, no proxy in
+/// between. The delta between this and http1_get is the proxy's overhead.
+fn bench_direct_get(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let test_addr = rt.block_on(create_test_server());
+    let client = reqwest::Client::new();
+
+    let mut group = c.benchmark_group("direct_get");
+    group.bench_function("get", |b| {
+        b.iter_custom(|iters| {
+            rt.block_on(async {
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    let response = client
+                        .get(format!("http://{test_addr}/test"))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status().as_u16(), StatusCode::OK.as_u16());
+                }
+                start.elapsed()
+            })
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_direct_get,
     bench_http1_get,
     bench_http2_get,
     bench_large_payload
