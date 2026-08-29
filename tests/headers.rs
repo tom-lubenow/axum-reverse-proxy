@@ -31,7 +31,7 @@ async fn test_proxy_header_handling() {
     server_ready.notified().await;
 
     // Create a reverse proxy
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
     let app: Router = proxy.into();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -143,7 +143,7 @@ async fn test_proxy_special_headers() {
     server_ready.notified().await;
 
     // Create a reverse proxy
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
     let app: Router = proxy.into();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -220,7 +220,7 @@ async fn setup_host_policy_proxy(policy: ProxyPolicy) -> (SocketAddr, SocketAddr
         axum::serve(upstream_listener, app).await.unwrap();
     });
 
-    let proxy = ReverseProxy::new("/", &format!("http://{upstream_addr}")).with_policy(policy);
+    let proxy = ReverseProxy::new("/", format!("http://{upstream_addr}")).with_policy(policy);
     let proxy_app: Router = proxy.into();
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -268,13 +268,98 @@ async fn host_header_with_default_policy_replaces_host_with_upstream_authority()
 
 #[tokio::test]
 async fn host_header_with_preserve_policy_forwards_client_host() {
-    let policy = ProxyPolicy {
-        host_behaviour: HostBehaviour::Preserve,
-    };
+    let policy = ProxyPolicy::new().with_host_behaviour(HostBehaviour::Preserve);
     let (_upstream_addr, proxy_addr) = setup_host_policy_proxy(policy).await;
 
     let seen = upstream_host_seen(proxy_addr, "client.example.com").await;
 
     // Preserve behaviour: the client's original host flows through unchanged.
     assert_eq!(seen, "client.example.com");
+}
+
+/// Hop-by-hop headers (standard and Connection-nominated) must be stripped by
+/// the proxy itself, without needing the RFC9110 layer.
+#[tokio::test]
+async fn test_hop_by_hop_headers_stripped_by_default() {
+    let app = Router::new().route("/headers", get(echo_headers));
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(upstream_listener, app).await.unwrap();
+    });
+
+    let proxy = ReverseProxy::new("/", format!("http://{upstream_addr}"));
+    let proxy_app: Router = proxy.into();
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let body: Value = client
+        .get(format!("http://{proxy_addr}/headers"))
+        .header("Connection", "keep-alive, x-hop")
+        .header("x-hop", "should-not-forward")
+        .header("Keep-Alive", "timeout=5")
+        .header("Proxy-Connection", "keep-alive")
+        .header("x-end-to-end", "kept")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let headers = body["headers"].as_object().unwrap();
+    assert!(!headers.contains_key("x-hop"));
+    assert!(!headers.contains_key("keep-alive"));
+    assert!(!headers.contains_key("proxy-connection"));
+    assert_eq!(headers["x-end-to-end"], "kept");
+}
+
+/// With connect info available, the proxy appends the client IP to
+/// X-Forwarded-For and sets X-Forwarded-Host.
+#[tokio::test]
+async fn test_x_forwarded_for_appended_with_connect_info() {
+    let app = Router::new().route("/headers", get(echo_headers));
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(upstream_listener, app).await.unwrap();
+    });
+
+    let proxy = ReverseProxy::new("/", format!("http://{upstream_addr}"));
+    let proxy_app: Router = proxy.into();
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            proxy_listener,
+            proxy_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let body: Value = client
+        .get(format!("http://{proxy_addr}/headers"))
+        .header("X-Forwarded-For", "203.0.113.7")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let headers = body["headers"].as_object().unwrap();
+    assert_eq!(headers["x-forwarded-for"], "203.0.113.7, 127.0.0.1");
+    assert_eq!(headers["x-forwarded-host"], format!("{proxy_addr}"));
 }

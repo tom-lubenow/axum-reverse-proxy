@@ -11,14 +11,16 @@ The eventual goal would be to benchmark ourselves against common reverse proxy l
 ## Features
 
 - 🛣 Path-based routing
-- 🔄 Optional retry mechanism with configurable delay
-- 📨 Header forwarding (with host header management)
+- 🔄 Optional retry mechanism (replays only requests that never reached the upstream)
+- 📨 Header forwarding with hop-by-hop headers stripped per RFC 9110 (`te: trailers` preserved for gRPC)
+- 🌐 `X-Forwarded-For` / `X-Forwarded-Host` support
 - ⚙ Configurable HTTP client settings
-- 🔀 Round-robin load balancing across multiple upstreams
+- 🔀 Round-robin and P2C load balancing across multiple upstreams
 - 🔌 Easy integration with Axum's Router
 - 🧰 Custom client configuration support
-- 🔒 HTTPS support
-- 📋 Optional RFC9110 compliance layer
+- 🔒 HTTPS support with HTTP/1.1 and HTTP/2 (ALPN) upstreams
+- 📦 Response trailers preserved (gRPC-compatible)
+- 📋 Optional RFC9110 compliance layer (Via headers, Max-Forwards, loop detection)
 - 🔧 Full Tower middleware support
 
 ## Installation
@@ -81,10 +83,71 @@ let dns_config = DnsDiscoveryConfig::new("api.example.com", 443)
     .with_refresh_interval(Duration::from_secs(30));
 let discovery = DnsDiscovery::new(dns_config).unwrap();
 
-let mut proxy = DiscoverableBalancedProxy::new("/api", discovery);
+let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+    .build(hyper_util::client::legacy::connect::HttpConnector::new());
+let proxy = DiscoverableBalancedProxy::new_with_client("/api", client, discovery);
 proxy.start_discovery().await;
 
 let app: Router = Router::new().nest_service("/", proxy);
+```
+
+### Proxy Policy
+
+Forwarding behaviour is controlled per proxy with `ProxyPolicy`:
+
+```rust
+use axum_reverse_proxy::{HostBehaviour, ProxyPolicy, ReverseProxy, XForwardedFor};
+use std::time::Duration;
+
+let policy = ProxyPolicy::new()
+    // Forward the client's Host header instead of the upstream authority
+    .with_host_behaviour(HostBehaviour::Preserve)
+    // Leave X-Forwarded-For untouched (default is Append)
+    .with_x_forwarded_for(XForwardedFor::Preserve)
+    // Upstream WebSocket connect timeout (default 5s)
+    .with_websocket_connect_timeout(Duration::from_secs(10));
+
+let proxy = ReverseProxy::new("/api", "https://api.example.com").with_policy(policy);
+```
+
+By default the proxy appends the connecting client's IP to `X-Forwarded-For`
+(and sets `X-Forwarded-Host`) whenever the server was started with
+`into_make_service_with_connect_info::<SocketAddr>()`; without connect info the
+headers are passed through untouched.
+
+### Retries
+
+`RetryLayer` retries a request only when the proxy failed to *connect* to the
+upstream — the request was never sent, so replay is safe for any method. A 502
+returned by the upstream itself is never retried. Request bodies are buffered
+(up to a configurable cap, default 2 MiB) so replays always carry the complete
+body; larger bodies stream through once without retries.
+
+```rust
+use axum::Router;
+use axum_reverse_proxy::{RetryLayer, ReverseProxy};
+
+let proxy = ReverseProxy::new("/", "http://backend.example.com");
+let app: Router = proxy.into();
+let app = app.layer(RetryLayer::new(3));
+```
+
+### Router Extension: `proxy_route`
+
+`ProxyRouterExt` adds proxy routes directly to a `Router`. Static string
+targets are base URLs — the request path beyond the route's literal prefix is
+appended — while `proxy_template` and custom `TargetResolver`s construct the
+full upstream URL themselves:
+
+```rust
+use axum::Router;
+use axum_reverse_proxy::{ProxyRouterExt, proxy_template};
+
+let app: Router = Router::new()
+    // /api/foo/bar -> https://api.example.com/foo/bar
+    .proxy_route("/api/{*rest}", "https://api.example.com")
+    // /users/42 -> https://users.example.com/42
+    .proxy_route("/users/{id}", proxy_template("https://users.example.com/{id}"));
 ```
 
 
@@ -183,7 +246,7 @@ let proxy = ReverseProxy::new("/api", "https://api.example.com")
 The RFC9110 layer provides:
 
 - **Connection Header Processing**: Properly handles Connection headers and removes hop-by-hop headers
-- **Via Header Management**: Adds and combines Via headers according to spec, with optional firewall mode
+- **Via Header Management**: Adds and combines Via headers according to spec
 - **Max-Forwards Processing**: Handles Max-Forwards header for TRACE/OPTIONS methods
 - **Loop Detection**: Detects request loops using Via headers and server names
 - **End-to-end Header Preservation**: Preserves end-to-end headers while removing hop-by-hop headers

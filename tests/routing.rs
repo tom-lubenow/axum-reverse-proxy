@@ -19,7 +19,7 @@ async fn test_proxy_nested_routing() {
     });
 
     // Create a reverse proxy
-    let proxy = ReverseProxy::new("/proxy", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/proxy", format!("http://{test_addr}"));
 
     // Create an app state
     #[derive(Clone)]
@@ -94,7 +94,7 @@ async fn test_proxy_path_handling() {
     });
 
     // Create a reverse proxy with empty path
-    let proxy = ReverseProxy::new("", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("", format!("http://{test_addr}"));
     let app: Router = proxy.into();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -166,8 +166,8 @@ async fn test_proxy_multiple_states() {
     });
 
     // Create proxies with different paths
-    let proxy1 = ReverseProxy::new("/api1", &format!("http://{addr1}"));
-    let proxy2 = ReverseProxy::new("/api2", &format!("http://{addr2}"));
+    let proxy1 = ReverseProxy::new("/api1", format!("http://{addr1}"));
+    let proxy2 = ReverseProxy::new("/api2", format!("http://{addr2}"));
 
     // Create app state
     #[derive(Clone)]
@@ -262,15 +262,12 @@ async fn test_proxy_exact_path_handling() {
 
     // Create a reverse proxy that maps /api to the test server
     let app: Router = Router::new()
-        .merge(ReverseProxy::new("/api", &format!("http://{test_addr}")))
+        .merge(ReverseProxy::new("/api", format!("http://{test_addr}")))
         .merge(ReverseProxy::new(
             "/_test",
-            &format!("http://{test_addr}/_test"),
+            format!("http://{test_addr}/_test"),
         ))
-        .merge(ReverseProxy::new(
-            "/foo",
-            &format!("http://{test_addr}/bar"),
-        ));
+        .merge(ReverseProxy::new("/foo", format!("http://{test_addr}/bar")));
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -348,7 +345,7 @@ async fn test_proxy_query_parameters() {
     });
 
     // Create a reverse proxy
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
     let app: Router = proxy.into();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -431,7 +428,7 @@ async fn test_no_extra_slash_for_empty_path_with_query() {
     });
 
     // Reverse proxy configured on a non-root path, targeting a sub-path on the upstream
-    let proxy = ReverseProxy::new("/proxy", &format!("http://{upstream_addr}/api"));
+    let proxy = ReverseProxy::new("/proxy", format!("http://{upstream_addr}/api"));
     let app: Router = proxy.into();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -469,7 +466,7 @@ async fn test_only_prefixed_paths_are_proxied() {
     });
 
     // Reverse proxy mounted at /api
-    let proxy = ReverseProxy::new("/api", &format!("http://{upstream_addr}"));
+    let proxy = ReverseProxy::new("/api", format!("http://{upstream_addr}"));
     let app: Router = proxy.into();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -521,7 +518,7 @@ async fn test_similar_prefix_is_not_stripped() {
 
     // Use the proxy directly as a fallback service (not nested),
     // so transform_uri may attempt to strip the configured base.
-    let proxy = ReverseProxy::new("/api", &format!("http://{upstream_addr}"));
+    let proxy = ReverseProxy::new("/api", format!("http://{upstream_addr}"));
     let app = Router::new().fallback_service(proxy);
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -571,7 +568,7 @@ async fn test_root_base_query_only_no_slash() {
     });
 
     // Base path is '/', target has a sub-path.
-    let proxy = ReverseProxy::new("/", &format!("http://{upstream_addr}/api"));
+    let proxy = ReverseProxy::new("/", format!("http://{upstream_addr}/api"));
     let app: Router = proxy.into();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -614,7 +611,7 @@ async fn test_encoded_boundary_stripping() {
     });
 
     // Use fallback service so boundary-aware stripping logic is exercised
-    let proxy = ReverseProxy::new("/foo%20bar", &format!("http://{upstream_addr}"));
+    let proxy = ReverseProxy::new("/foo%20bar", format!("http://{upstream_addr}"));
     let app = Router::new().fallback_service(proxy);
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -674,7 +671,7 @@ async fn test_root_base_matrix() {
     });
 
     // Base '/'; target '/api'
-    let proxy = ReverseProxy::new("/", &format!("http://{upstream_addr}/api"));
+    let proxy = ReverseProxy::new("/", format!("http://{upstream_addr}/api"));
     let app: Router = proxy.into();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -712,16 +709,16 @@ async fn test_methods_preserve_join() {
     let upstream = Router::new()
         .route(
             "/{*path}",
-            get(echo_handler.clone())
-                .post(echo_handler.clone())
-                .put(echo_handler.clone())
-                .delete(echo_handler.clone()),
+            get(echo_handler)
+                .post(echo_handler)
+                .put(echo_handler)
+                .delete(echo_handler),
         )
         .route(
             "/",
-            get(echo_handler.clone())
-                .post(echo_handler.clone())
-                .put(echo_handler.clone())
+            get(echo_handler)
+                .post(echo_handler)
+                .put(echo_handler)
                 .delete(echo_handler),
         );
 
@@ -731,7 +728,7 @@ async fn test_methods_preserve_join() {
         axum::serve(upstream_listener, upstream).await.unwrap();
     });
 
-    let proxy = ReverseProxy::new("/api", &format!("http://{upstream_addr}/tgt"));
+    let proxy = ReverseProxy::new("/api", format!("http://{upstream_addr}/tgt"));
     let app: Router = proxy.into();
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();

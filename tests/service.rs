@@ -23,7 +23,7 @@ async fn test_proxy_service_get() {
         axum::serve(test_listener, app).await.unwrap();
     });
 
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
 
     let request = Request::builder().uri("/test").body(Body::empty()).unwrap();
 
@@ -50,7 +50,7 @@ async fn test_proxy_service_post() {
         axum::serve(test_listener, app).await.unwrap();
     });
 
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
 
     let test_body = json!({"message": "Hello, proxy!"});
     let request = Request::builder()

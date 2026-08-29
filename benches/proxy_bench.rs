@@ -37,7 +37,7 @@ fn bench_http1_get(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let test_addr = rt.block_on(create_test_server());
 
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
     let app: Router = proxy.into();
 
     let proxy_listener = rt.block_on(async {
@@ -81,7 +81,7 @@ fn bench_http1_get(c: &mut Criterion) {
 fn bench_http2_get(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let test_addr = rt.block_on(create_test_server());
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
     let app: Router = proxy.into();
 
     let proxy_listener = rt.block_on(async {
@@ -129,7 +129,7 @@ fn bench_large_payload(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let test_addr = rt.block_on(create_test_server());
 
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
     let app: Router = proxy.into();
 
     let proxy_listener = rt.block_on(async {

@@ -84,7 +84,7 @@ async fn create_capturing_app(config: Option<Rfc9110Config>) -> CaptureBackendAp
     });
     backend_ready.notified().await;
 
-    let proxy = ReverseProxy::new("/", &format!("http://{backend_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{backend_addr}"));
     let proxy_router: Router = proxy.into();
     let app = if let Some(config) = config {
         Router::new()
@@ -156,9 +156,8 @@ async fn test_hop_by_hop_header_removal() {
 
 #[tokio::test]
 async fn test_max_forwards_trace() {
+    // Max-Forwards = 0: respond directly without forwarding
     let app = create_test_app(None);
-
-    // Test Max-Forwards = 0
     let request = Request::builder()
         .method(Method::TRACE)
         .uri("/test")
@@ -167,64 +166,68 @@ async fn test_max_forwards_trace() {
         .unwrap();
 
     let response = app.clone().oneshot(request).await.unwrap();
-
-    // Should not forward request when Max-Forwards is 0
     assert_eq!(response.status(), StatusCode::OK);
 
-    // Test Max-Forwards > 0
-    let request = Request::builder()
-        .method(Method::TRACE)
-        .uri("/test")
+    // Max-Forwards > 0: forward with a decremented value
+    let app = create_capturing_app(None).await;
+    let client = create_client();
+
+    client
+        .request(
+            reqwest::Method::TRACE,
+            format!("http://{}/test", app.proxy_addr),
+        )
         .header("Max-Forwards", "5")
-        .body(Body::empty())
+        .send()
+        .await
         .unwrap();
 
-    let response = app.clone().oneshot(request).await.unwrap();
-
-    // Should decrement Max-Forwards
+    let upstream_headers = app.upstream_received_headers().await;
     assert_eq!(
-        response.headers().get("max-forwards").unwrap(),
+        upstream_headers.get("max-forwards").unwrap(),
         HeaderValue::from_static("4")
     );
 }
 
 #[tokio::test]
 async fn test_max_forwards_options() {
-    let app = create_test_app(None);
+    let app = create_capturing_app(None).await;
+    let client = create_client();
 
-    // Test Max-Forwards with OPTIONS method
-    let request = Request::builder()
-        .method(Method::OPTIONS)
-        .uri("/test")
+    client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("http://{}/test", app.proxy_addr),
+        )
         .header("Max-Forwards", "3")
-        .body(Body::empty())
+        .send()
+        .await
         .unwrap();
 
-    let response = app.clone().oneshot(request).await.unwrap();
-
+    // Forwarded with a decremented value
+    let upstream_headers = app.upstream_received_headers().await;
     assert_eq!(
-        response.headers().get("max-forwards").unwrap(),
+        upstream_headers.get("max-forwards").unwrap(),
         HeaderValue::from_static("2")
     );
 }
 
 #[tokio::test]
 async fn test_max_forwards_ignored_for_other_methods() {
-    let app = create_test_app(None);
+    let app = create_capturing_app(None).await;
+    let client = create_client();
 
-    // Max-Forwards should be ignored for other methods
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri("/test")
+    client
+        .get(format!("http://{}/test", app.proxy_addr))
         .header("Max-Forwards", "5")
-        .body(Body::empty())
+        .send()
+        .await
         .unwrap();
 
-    let response = app.clone().oneshot(request).await.unwrap();
-
-    // Max-Forwards should be unchanged
+    // Max-Forwards should be forwarded unchanged for non-TRACE/OPTIONS
+    let upstream_headers = app.upstream_received_headers().await;
     assert_eq!(
-        response.headers().get("max-forwards").unwrap(),
+        upstream_headers.get("max-forwards").unwrap(),
         HeaderValue::from_static("5")
     );
 }
@@ -491,21 +494,31 @@ async fn test_max_forwards_zero_trace_response() {
 
     let request = Request::builder()
         .method(Method::TRACE)
-        .uri("/test")
+        .uri("/test?q=1")
         .header("Max-Forwards", "0")
+        .header("X-Custom", "value")
+        .header("Authorization", "Bearer secret-token")
+        .header("Cookie", "session=secret-cookie")
         .body(Body::empty())
         .unwrap();
-    // Capture a debug representation of the original request before it's moved
-    let request_debug = format!("{:?}", &request);
 
     let response = app.clone().oneshot(request).await.unwrap();
 
-    // Should return 200 OK with the request as the body
+    // Should return 200 OK with a message/http echo of the request
     assert_eq!(response.status(), StatusCode::OK);
-    // Read the body and ensure it contains the original request text
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        HeaderValue::from_static("message/http")
+    );
     let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body_str = std::str::from_utf8(&body_bytes).unwrap();
-    assert!(body_str.contains(&request_debug));
+    assert!(body_str.starts_with("TRACE /test?q=1 HTTP/1.1\r\n"));
+    assert!(body_str.contains("x-custom: value\r\n"));
+    // Sensitive fields must not be reflected (RFC 9110 §9.3.8)
+    assert!(!body_str.contains("secret-token"));
+    assert!(!body_str.contains("secret-cookie"));
+    assert!(!body_str.to_lowercase().contains("authorization"));
+    assert!(!body_str.to_lowercase().contains("cookie"));
 }
 
 #[tokio::test]

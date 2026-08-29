@@ -50,7 +50,7 @@ async fn test_discoverable_proxy_into_router() {
     let connector = HttpConnector::new();
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
 
-    let mut proxy = DiscoverableBalancedProxy::new_with_client("/api", client, discovery_stream);
+    let proxy = DiscoverableBalancedProxy::new_with_client("/api", client, discovery_stream);
     proxy.start_discovery().await;
 
     // Give discovery some time

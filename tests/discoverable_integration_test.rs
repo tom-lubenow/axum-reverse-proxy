@@ -37,7 +37,7 @@ impl Stream for DynamicDiscoveryStream {
         let current_count = self.counter.load(Ordering::SeqCst);
         if current_count < self.services.len() {
             // Only add a service every few polls to simulate real discovery
-            if self.index % 3 == 0 && current_count < self.services.len() {
+            if self.index.is_multiple_of(3) && current_count < self.services.len() {
                 let service = self.services[current_count].clone();
                 self.counter.store(current_count + 1, Ordering::SeqCst);
                 Poll::Ready(Some(Ok(Change::Insert(current_count, service))))

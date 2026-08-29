@@ -75,6 +75,26 @@ impl DnsDiscoveryConfig {
     }
 }
 
+/// Build a resolver honouring the config's optional `resolver_config` and
+/// `resolver_opts`, independently of one another. Falls back to the system
+/// configuration when no `resolver_config` is given.
+fn build_resolver(
+    config: &DnsDiscoveryConfig,
+) -> Result<TokioResolver, Box<dyn std::error::Error + Send + Sync>> {
+    let mut builder = match &config.resolver_config {
+        Some(resolver_config) => Resolver::builder_with_config(
+            resolver_config.clone(),
+            TokioConnectionProvider::default(),
+        ),
+        None => Resolver::builder_tokio()
+            .map_err(|e| format!("Failed to create resolver from system config: {e}"))?,
+    };
+    if let Some(opts) = &config.resolver_opts {
+        builder = builder.with_options(opts.clone());
+    }
+    Ok(builder.build())
+}
+
 /// DNS-based service discovery implementation
 ///
 /// This discoverer resolves A/AAAA records for a hostname and treats each IP address
@@ -91,19 +111,7 @@ impl DnsDiscovery {
     pub fn new(
         config: DnsDiscoveryConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let resolver = if let (Some(resolver_config), Some(_opts)) =
-            (&config.resolver_config, &config.resolver_opts)
-        {
-            Resolver::builder_with_config(
-                resolver_config.clone(),
-                TokioConnectionProvider::default(),
-            )
-            .build()
-        } else {
-            Resolver::builder_tokio()
-                .map_err(|e| format!("Failed to create resolver from system config: {e}"))?
-                .build()
-        };
+        let resolver = build_resolver(&config)?;
 
         let (sender, receiver) = mpsc::unbounded_channel();
 
@@ -171,7 +179,7 @@ impl DnsDiscovery {
         }
 
         // Find services to remove (in current but not in new)
-        for (ip, _) in current_services.iter() {
+        for ip in current_services.keys() {
             if !new_services.contains_key(ip) {
                 debug!("Removing service: {}", ip);
                 let _ = sender.send(Ok(Change::Remove(*ip)));
@@ -200,7 +208,12 @@ impl Stream for DnsDiscovery {
         // Try to lock the receiver without blocking
         match self.receiver.try_lock() {
             Ok(mut receiver) => receiver.poll_recv(cx),
-            Err(_) => Poll::Pending, // If we can't get the lock, return Pending
+            Err(_) => {
+                // Another clone holds the lock. Wake ourselves so this task is
+                // polled again rather than sleeping with no registered waker.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
         }
     }
 }
@@ -222,19 +235,7 @@ impl StaticDnsDiscovery {
     pub fn new(
         config: DnsDiscoveryConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let resolver = if let (Some(resolver_config), Some(_opts)) =
-            (&config.resolver_config, &config.resolver_opts)
-        {
-            Resolver::builder_with_config(
-                resolver_config.clone(),
-                TokioConnectionProvider::default(),
-            )
-            .build()
-        } else {
-            Resolver::builder_tokio()
-                .map_err(|e| format!("Failed to create resolver from system config: {e}"))?
-                .build()
-        };
+        let resolver = build_resolver(&config)?;
 
         let (sender, receiver) = mpsc::unbounded_channel();
 

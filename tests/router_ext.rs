@@ -26,6 +26,9 @@ async fn create_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         .route("/api/{*rest}", get(|axum::extract::Path(rest): axum::extract::Path<String>| async move {
             format!("api:{}", rest)
         }))
+        .route("/echo-query", get(|req: Request<Body>| async move {
+            req.uri().query().unwrap_or("<none>").to_string()
+        }))
         .route("/echo-host", get(|req: Request<Body>| async move {
             req.headers()
                 .get("host")
@@ -234,11 +237,11 @@ async fn test_multiple_proxy_routes() {
     let app: Router = Router::new()
         .proxy_route(
             "/users/{id}",
-            proxy_template(&format!("{}/users/{{id}}", base)),
+            proxy_template(format!("{}/users/{{id}}", base)),
         )
         .proxy_route(
             "/videos/{id}/{q}",
-            proxy_template(&format!("{}/videos/{{id}}/{{q}}", base)),
+            proxy_template(format!("{}/videos/{{id}}/{{q}}", base)),
         );
 
     // Test first route
@@ -272,9 +275,7 @@ async fn proxy_route_with_preserve_policy_forwards_client_host() {
     let app: Router = Router::new().proxy_route_with_policy(
         "/echo-host",
         target,
-        ProxyPolicy {
-            host_behaviour: HostBehaviour::Preserve,
-        },
+        ProxyPolicy::new().with_host_behaviour(HostBehaviour::Preserve),
     );
 
     let req = Request::builder()
@@ -315,4 +316,72 @@ async fn proxy_route_with_default_policy_replaces_host_with_upstream_authority()
         .await
         .unwrap();
     assert_eq!(&body[..], backend_addr.to_string().as_bytes());
+}
+
+/// A static string target is a base URL: the request path beyond the route's
+/// literal prefix must be appended (regression test — this used to silently
+/// forward every request to the target's root path).
+#[tokio::test]
+async fn test_static_target_wildcard_appends_path() {
+    let (backend_addr, _handle) = create_backend().await;
+    let target = format!("http://{}", backend_addr);
+
+    let app: Router = Router::new().proxy_route("/gateway/{*rest}", target);
+
+    let req = Request::builder()
+        .uri("/gateway/api/foo/bar")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"api:foo/bar");
+}
+
+/// A static base URL with its own path joins the remaining request path onto it.
+#[tokio::test]
+async fn test_static_target_with_base_path_appends_remainder() {
+    let (backend_addr, _handle) = create_backend().await;
+    let target = format!("http://{}/api", backend_addr);
+
+    let app: Router = Router::new().proxy_route("/gateway/{*rest}", target);
+
+    let req = Request::builder()
+        .uri("/gateway/foo/bar")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"api:foo/bar");
+}
+
+/// Query strings survive base-URL path appending.
+#[tokio::test]
+async fn test_static_target_wildcard_preserves_query() {
+    let (backend_addr, _handle) = create_backend().await;
+    let target = format!("http://{}", backend_addr);
+
+    let app: Router = Router::new().proxy_route("/gateway/{*rest}", target);
+
+    let req = Request::builder()
+        .uri("/gateway/echo-query?a=1&b=2")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"a=1&b=2");
 }

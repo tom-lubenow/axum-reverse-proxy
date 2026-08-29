@@ -77,7 +77,7 @@ async fn setup_test_server(target_prefix: &str) -> (SocketAddr, SocketAddr) {
     });
 
     // Create the proxy server
-    let proxy = ReverseProxy::new("/", &format!("{target_prefix}{upstream_addr}"));
+    let proxy = ReverseProxy::new("/", format!("{target_prefix}{upstream_addr}"));
     let proxy_app: Router = proxy.into();
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -145,7 +145,7 @@ async fn test_websocket_path_query_join_parity() {
     });
 
     // Mount mode
-    let mount_proxy = ReverseProxy::new("/base", &format!("http://{upstream_addr}/api"));
+    let mount_proxy = ReverseProxy::new("/base", format!("http://{upstream_addr}/api"));
     let mount_app: Router = mount_proxy.into();
     let mount_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mount_addr = mount_listener.local_addr().unwrap();
@@ -175,7 +175,7 @@ async fn test_websocket_path_query_join_parity() {
         axum::serve(upstream_listener2, app2).await.unwrap();
     });
 
-    let fb_proxy = ReverseProxy::new("/base", &format!("http://{upstream_addr2}/api"));
+    let fb_proxy = ReverseProxy::new("/base", format!("http://{upstream_addr2}/api"));
     let fb_app = Router::new().fallback_service(fb_proxy);
     let fb_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let fb_addr = fb_listener.local_addr().unwrap();
@@ -426,7 +426,7 @@ async fn setup_ws_host_policy_proxy(
         axum::serve(upstream_listener, app).await.unwrap();
     });
 
-    let proxy = ReverseProxy::new("/", &format!("http://{upstream_addr}")).with_policy(policy);
+    let proxy = ReverseProxy::new("/", format!("http://{upstream_addr}")).with_policy(policy);
     let proxy_app: Router = proxy.into();
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -485,9 +485,7 @@ async fn websocket_host_header_with_default_policy_replaces_host_with_upstream_a
 async fn websocket_host_header_with_preserve_policy_forwards_single_client_host() {
     use axum_reverse_proxy::{HostBehaviour, ProxyPolicy};
 
-    let policy = ProxyPolicy {
-        host_behaviour: HostBehaviour::Preserve,
-    };
+    let policy = ProxyPolicy::new().with_host_behaviour(HostBehaviour::Preserve);
     let (_upstream_addr, proxy_addr, mut rx) = setup_ws_host_policy_proxy(policy).await;
 
     let hosts = upstream_ws_hosts_seen(proxy_addr, "client.example.com", &mut rx).await;
@@ -500,4 +498,58 @@ async fn websocket_host_header_with_preserve_policy_forwards_single_client_host(
         "expected exactly one host header, got {hosts:?}"
     );
     assert_eq!(hosts[0], "client.example.com");
+}
+
+/// Close frames must be forwarded with their original code and reason
+/// (regression test — the proxy used to replace them with an empty close).
+#[tokio::test]
+async fn test_websocket_close_code_forwarded() {
+    use axum::extract::ws::CloseFrame;
+
+    // Upstream server that closes immediately with a specific code and reason.
+    async fn closing_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
+        ws.on_upgrade(|mut socket| async move {
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: 4001,
+                    reason: "going away for tests".into(),
+                })))
+                .await;
+        })
+    }
+
+    let app = Router::new().route("/ws", get(closing_handler));
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(upstream_listener, app).await.unwrap();
+    });
+
+    let proxy = ReverseProxy::new("/", format!("http://{upstream_addr}"));
+    let proxy_app: Router = proxy.into();
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, proxy_app).await.unwrap();
+    });
+
+    let url = format!("ws://127.0.0.1:{}/ws", proxy_addr.port());
+    let (mut ws_stream, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect");
+
+    // The first (and only) frame should be the upstream's close, verbatim.
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws_stream.next())
+        .await
+        .expect("timed out waiting for close frame")
+        .expect("connection ended without a close frame")
+        .expect("websocket error");
+
+    match msg {
+        tungstenite::Message::Close(Some(frame)) => {
+            assert_eq!(u16::from(frame.code), 4001);
+            assert_eq!(frame.reason, "going away for tests");
+        }
+        other => panic!("expected close frame with code/reason, got {other:?}"),
+    }
 }

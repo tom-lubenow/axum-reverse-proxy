@@ -208,21 +208,10 @@ where
                 return Ok(response);
             }
 
-            // Save original Max-Forwards value for non-TRACE/OPTIONS methods
-            let original_max_forwards =
-                if request.method() != Method::TRACE && request.method() != Method::OPTIONS {
-                    request.headers().get(http::header::MAX_FORWARDS).cloned()
-                } else {
-                    None
-                };
-
             // 2. Process Max-Forwards
             if let Some(response) = process_max_forwards(&mut request) {
                 return Ok(response);
             }
-
-            // Save the Max-Forwards value after processing
-            let max_forwards = request.headers().get(http::header::MAX_FORWARDS).cloned();
 
             // Detect WebSocket upgrade request to preserve necessary headers
             let is_websocket =
@@ -244,27 +233,7 @@ where
 
             // 7. Add Via header to response (use the same one we set in the request)
             if let Some(via) = via_header {
-                // In firewall mode, always use "1.1 firewall"
-                if config.pseudonym.is_some() && !config.combine_via {
-                    response
-                        .headers_mut()
-                        .insert(http::header::VIA, HeaderValue::from_static("1.1 firewall"));
-                } else {
-                    response.headers_mut().insert(http::header::VIA, via);
-                }
-            }
-
-            // 8. Restore Max-Forwards header
-            if let Some(max_forwards) = original_max_forwards {
-                // For non-TRACE/OPTIONS methods, restore original value
-                response
-                    .headers_mut()
-                    .insert(http::header::MAX_FORWARDS, max_forwards);
-            } else if let Some(max_forwards) = max_forwards {
-                // For TRACE/OPTIONS, copy the decremented value to the response
-                response
-                    .headers_mut()
-                    .insert(http::header::MAX_FORWARDS, max_forwards);
+                response.headers_mut().insert(http::header::VIA, via);
             }
 
             Ok(response)
@@ -321,7 +290,14 @@ fn process_max_forwards(request: &mut Request<Body>) -> Option<Response<Body>> {
                 if value == 0 {
                     let mut response = Response::new(Body::empty());
                     if *method == Method::TRACE {
-                        *response.body_mut() = Body::from(format!("{request:?}"));
+                        // Echo the request in message/http format (RFC 9110
+                        // §9.3.8), excluding sensitive fields such as
+                        // credentials and cookies.
+                        *response.body_mut() = Body::from(trace_echo_body(request));
+                        response.headers_mut().insert(
+                            http::header::CONTENT_TYPE,
+                            HeaderValue::from_static("message/http"),
+                        );
                     } else {
                         // For OPTIONS, return 200 OK with Allow header
                         response.headers_mut().insert(
@@ -349,6 +325,40 @@ fn process_max_forwards(request: &mut Request<Body>) -> Option<Response<Body>> {
     } else {
         None // No Max-Forwards header
     }
+}
+
+/// Headers excluded from TRACE echo responses because they commonly carry
+/// credentials or other sensitive data (RFC 9110 §9.3.8).
+static TRACE_SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+];
+
+/// Render a sanitized message/http echo of the request for TRACE responses.
+fn trace_echo_body(request: &Request<Body>) -> String {
+    let mut body = format!(
+        "{} {} {:?}\r\n",
+        request.method(),
+        request
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/"),
+        request.version()
+    );
+    for (name, value) in request.headers() {
+        if TRACE_SENSITIVE_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
+        body.push_str(name.as_str());
+        body.push_str(": ");
+        body.push_str(value.to_str().unwrap_or("<non-ascii value omitted>"));
+        body.push_str("\r\n");
+    }
+    body.push_str("\r\n");
+    body
 }
 
 /// Headers that should be preserved for WebSocket upgrades
@@ -426,29 +436,20 @@ fn add_via_header(request: &mut Request<Body>, config: &Rfc9110Config) -> Option
     // Get the pseudonym from the config or use the default
     let pseudonym = config.pseudonym.as_deref().unwrap_or("proxy");
 
-    // If we're in firewall mode, always use "1.1 firewall"
-    if config.pseudonym.is_some() && !config.combine_via {
-        let via = HeaderValue::from_static("1.1 firewall");
-        request.headers_mut().insert(http::header::VIA, via.clone());
-        return Some(via);
-    }
-
     // Get any existing Via headers
     let mut via_values = Vec::new();
     if let Some(existing_via) = request.headers().get(http::header::VIA)
         && let Ok(existing_via_str) = existing_via.to_str()
     {
         // If we're combining Via headers and have a pseudonym, replace all entries with our protocol version
-        if config.combine_via && config.pseudonym.is_some() {
+        if config.combine_via
+            && let Some(config_pseudonym) = &config.pseudonym
+        {
             let entries: Vec<_> = existing_via_str.split(',').map(|s| s.trim()).collect();
             let all_same_protocol = entries.iter().all(|s| s.starts_with(protocol_version));
             if all_same_protocol {
-                let via = HeaderValue::from_str(&format!(
-                    "{} {}",
-                    protocol_version,
-                    config.pseudonym.as_ref().unwrap()
-                ))
-                .ok()?;
+                let via = HeaderValue::from_str(&format!("{protocol_version} {config_pseudonym}"))
+                    .ok()?;
                 request.headers_mut().insert(http::header::VIA, via.clone());
                 return Some(via);
             }
@@ -521,16 +522,6 @@ fn process_response_headers(response: &mut Response<Body>, preserve_websocket: b
 
     for header in headers_to_remove {
         response.headers_mut().remove(&header);
-    }
-
-    // Handle Via header in response - if in firewall mode, replace all entries with "1.1 firewall"
-    if let Some(via) = response.headers().get(http::header::VIA)
-        && let Ok(via_str) = via.to_str()
-        && via_str.contains("firewall")
-    {
-        response
-            .headers_mut()
-            .insert(http::header::VIA, HeaderValue::from_static("1.1 firewall"));
     }
 }
 

@@ -5,8 +5,15 @@
 //! It supports:
 //!
 //! - Path-based routing
-//! - Optional retry mechanism via a [`tower::Layer`]
-//! - Header forwarding
+//! - Optional retry mechanism via a [`tower::Layer`] (replays only requests
+//!   that never reached the upstream)
+//! - Header forwarding with hop-by-hop headers stripped per RFC 9110 §7.6.1
+//!   (`te: trailers` is preserved for gRPC)
+//! - `X-Forwarded-For` / `X-Forwarded-Host` support (see
+//!   [`XForwardedFor`]) when the server is started with
+//!   [`into_make_service_with_connect_info`](axum::Router::into_make_service_with_connect_info)
+//! - HTTP/1.1 and HTTP/2 (ALPN) upstream connections, with response trailers
+//!   preserved (gRPC-compatible)
 //! - Configurable HTTP client settings
 //! - Round-robin load balancing across multiple upstreams
 //! - WebSocket proxying with:
@@ -325,7 +332,8 @@ pub use danger::create_dangerous_native_tls_connector;
 pub use danger::create_dangerous_rustls_config;
 #[cfg(feature = "dns")]
 pub use dns_discovery::{DnsDiscovery, DnsDiscoveryConfig, StaticDnsDiscovery};
-pub use proxy::{HostBehaviour, ProxyPolicy, ReverseProxy};
+pub use forward::ProxyError;
+pub use proxy::{HostBehaviour, ProxyPolicy, ReverseProxy, XForwardedFor};
 pub use retry::RetryLayer;
 pub use rfc9110::{Rfc9110Config, Rfc9110Layer};
 pub use router_ext::{ProxyRouterExt, TargetResolver, TemplateTarget, proxy_template};

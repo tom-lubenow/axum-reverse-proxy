@@ -3,6 +3,7 @@ use http::Uri;
 use http::uri::Builder as UriBuilder;
 use hyper_util::client::legacy::{Client, connect::Connect};
 use std::convert::Infallible;
+use std::time::Duration;
 use tracing::trace;
 
 use crate::forward::{ProxyConnector, create_http_connector, forward_request};
@@ -16,18 +17,78 @@ use crate::forward::{ProxyConnector, create_http_connector, forward_request};
 pub struct ReverseProxy<C: Connect + Clone + Send + Sync + 'static> {
     path: String,
     target: String,
+    scheme: String,
+    authority: String,
+    /// Normalized target base path: `""` for `/`, otherwise `/foo` with no
+    /// trailing slash.
+    target_base_path: String,
+    /// Whether the configured target path ended with a trailing slash
+    /// (excluding a bare `/`), which is preserved when no path remains.
+    target_trailing_slash: bool,
     client: Client<C, Body>,
     policy: ProxyPolicy,
 }
 
-/// Proxy route and behavioural config to every request a [`ReverseProxy`] forwards.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Proxy route and behavioural config applied to every request a
+/// [`ReverseProxy`] forwards.
+///
+/// Construct with [`ProxyPolicy::new`] (or `Default`) and customize with the
+/// builder methods:
+///
+/// ```rust
+/// use axum_reverse_proxy::{HostBehaviour, ProxyPolicy};
+///
+/// let policy = ProxyPolicy::new().with_host_behaviour(HostBehaviour::Preserve);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ProxyPolicy {
     /// How the upstream `Host` header is derived. See [`HostBehaviour`].
     pub host_behaviour: HostBehaviour,
+    /// How `X-Forwarded-For` is handled. See [`XForwardedFor`].
+    pub x_forwarded_for: XForwardedFor,
+    /// How long to wait when establishing an upstream WebSocket connection
+    /// before failing the client's upgrade request. Default: 5 seconds.
+    pub websocket_connect_timeout: Duration,
+}
+
+impl Default for ProxyPolicy {
+    fn default() -> Self {
+        Self {
+            host_behaviour: HostBehaviour::default(),
+            x_forwarded_for: XForwardedFor::default(),
+            websocket_connect_timeout: Duration::from_secs(5),
+        }
+    }
 }
 
 impl ProxyPolicy {
+    /// Create a policy with default behaviour.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set how the upstream `Host` header is derived.
+    #[must_use]
+    pub fn with_host_behaviour(mut self, behaviour: HostBehaviour) -> Self {
+        self.host_behaviour = behaviour;
+        self
+    }
+
+    /// Set how `X-Forwarded-For` is handled.
+    #[must_use]
+    pub fn with_x_forwarded_for(mut self, mode: XForwardedFor) -> Self {
+        self.x_forwarded_for = mode;
+        self
+    }
+
+    /// Set the upstream WebSocket connect timeout.
+    #[must_use]
+    pub fn with_websocket_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.websocket_connect_timeout = timeout;
+        self
+    }
+
     /// Whether the client's original `Host` header is forwarded upstream rather
     /// than replaced with the upstream authority
     pub(crate) fn forwards_client_host(&self) -> bool {
@@ -63,10 +124,28 @@ impl ProxyPolicy {
 pub enum HostBehaviour {
     /// Forward the client's original `Host` header unchanged.
     Preserve,
-    /// Replace `Host` with the upstream target's authority (the default, and
-    /// the behaviour of every prior release).
+    /// Replace `Host` with the upstream target's authority (the default).
     #[default]
     Replace,
+}
+
+/// Controls how the `X-Forwarded-For` header is handled for forwarded requests.
+///
+/// The client's address is only known when the Axum server was started with
+/// [`into_make_service_with_connect_info`](axum::Router::into_make_service_with_connect_info);
+/// without it, no address is available and the header is left untouched in
+/// either mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum XForwardedFor {
+    /// Append the connecting client's IP address to `X-Forwarded-For`
+    /// (creating the header if absent), and set `X-Forwarded-Host` from the
+    /// client's `Host` header when not already present. This is the default
+    /// and matches conventional reverse proxy behaviour.
+    #[default]
+    Append,
+    /// Leave `X-Forwarded-For` and `X-Forwarded-Host` exactly as the client
+    /// sent them.
+    Preserve,
 }
 
 pub type StandardReverseProxy = ReverseProxy<ProxyConnector>;
@@ -79,6 +158,11 @@ impl StandardReverseProxy {
     /// * `path` - The base path to match incoming requests against (e.g., "/api")
     /// * `target` - The upstream server URL to forward requests to (e.g., "https://api.example.com")
     ///
+    /// # Panics
+    ///
+    /// Panics if `target` is not a valid URI with an authority (host). The
+    /// target is validated once here rather than on every request.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -86,9 +170,10 @@ impl StandardReverseProxy {
     ///
     /// let proxy = ReverseProxy::new("/api", "https://api.example.com");
     /// ```
-    pub fn new<S>(path: S, target: S) -> Self
+    pub fn new<P, T>(path: P, target: T) -> Self
     where
-        S: Into<String>,
+        P: Into<String>,
+        T: Into<String>,
     {
         let client = Client::builder(hyper_util::rt::TokioExecutor::new())
             .pool_idle_timeout(std::time::Duration::from_secs(60))
@@ -113,6 +198,11 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
     /// * `target` - The upstream server URL to forward requests to
     /// * `client` - A custom-configured HTTP client
     ///
+    /// # Panics
+    ///
+    /// Panics if `target` is not a valid URI with an authority (host). The
+    /// target is validated once here rather than on every request.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -131,13 +221,38 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
     ///     client,
     /// );
     /// ```
-    pub fn new_with_client<S>(path: S, target: S, client: Client<C, Body>) -> Self
+    pub fn new_with_client<P, T>(path: P, target: T, client: Client<C, Body>) -> Self
     where
-        S: Into<String>,
+        P: Into<String>,
+        T: Into<String>,
     {
+        let target = target.into();
+        let target_uri: Uri = target
+            .parse()
+            .unwrap_or_else(|e| panic!("ReverseProxy target {target:?} is not a valid URI: {e}"));
+        let scheme = target_uri.scheme_str().unwrap_or("http").to_string();
+        let authority = target_uri
+            .authority()
+            .unwrap_or_else(|| {
+                panic!("ReverseProxy target {target:?} must include an authority (host)")
+            })
+            .as_str()
+            .to_string();
+        let target_path = target_uri.path();
+        let target_trailing_slash = target_path.ends_with('/') && target_path != "/";
+        let target_base_path = if target_path == "/" {
+            String::new()
+        } else {
+            target_path.trim_end_matches('/').to_string()
+        };
+
         Self {
             path: path.into(),
-            target: target.into(),
+            target,
+            scheme,
+            authority,
+            target_base_path,
+            target_trailing_slash,
             client,
             policy: ProxyPolicy::default(),
         }
@@ -183,7 +298,7 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
         forward_request(upstream_uri, req, &self.client, &self.policy).await
     }
 
-    /// Transform an incoming request path+query into the target URI using http::Uri builder
+    /// Transform an incoming request path+query into the target URI.
     ///
     /// Rules:
     /// - Trim target trailing slash for joining
@@ -192,33 +307,6 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
     /// - Do not add a slash for query-only joins (avoid target '/?')
     fn transform_uri(&self, path_and_query: &str) -> Uri {
         let base_path = self.path.trim_end_matches('/');
-
-        // Parse target URI
-        let target_uri: Uri = self
-            .target
-            .parse()
-            .expect("ReverseProxy target must be a valid URI");
-
-        let scheme = target_uri.scheme_str().unwrap_or("http");
-        let authority = target_uri
-            .authority()
-            .expect("ReverseProxy target must include authority (host)")
-            .as_str()
-            .to_string();
-
-        // Check if target originally had a trailing slash
-        let target_has_trailing_slash =
-            target_uri.path().ends_with('/') && target_uri.path() != "/";
-
-        // Normalize target base path: drop trailing slash and treat "/" as empty
-        let target_base_path = {
-            let p = target_uri.path();
-            if p == "/" {
-                ""
-            } else {
-                p.trim_end_matches('/')
-            }
-        };
 
         // Split incoming path and query
         let (path_part, query_part) = match path_and_query.find('?') {
@@ -240,46 +328,22 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
             path_part
         };
 
-        // Join target base path with remainder
-        let joined_path = if remaining_path.is_empty() {
-            if target_base_path.is_empty() {
-                "/"
-            } else if target_has_trailing_slash {
-                // Preserve trailing slash from target when no remaining path
-                "__TRAILING__"
+        // Join the target base path with the remainder. `remaining_path` is
+        // either empty or starts with '/', and `target_base_path` is either
+        // empty or `/`-prefixed with no trailing slash, so plain concatenation
+        // never duplicates a slash.
+        let mut path_and_query_buf = if remaining_path.is_empty() {
+            if self.target_base_path.is_empty() {
+                "/".to_string()
+            } else if self.target_trailing_slash {
+                format!("{}/", self.target_base_path)
             } else {
-                target_base_path
+                self.target_base_path.clone()
             }
         } else {
-            // remaining_path starts with '/'; concatenate without duplicating slash
-            if target_base_path.is_empty() {
-                remaining_path
-            } else {
-                // allocate a small string to join
-                // SAFETY: both parts are valid path slices
-                // Build into a String for path_and_query
-                // We will rebuild below
-                // Placeholder; real joining below
-                "__JOIN__"
-            }
+            format!("{}{}", self.target_base_path, remaining_path)
         };
 
-        // Build final path_and_query string explicitly to keep exact bytes
-        let final_path = if joined_path == "__JOIN__" {
-            let mut s = String::with_capacity(target_base_path.len() + remaining_path.len());
-            s.push_str(target_base_path);
-            s.push_str(remaining_path);
-            s
-        } else if joined_path == "__TRAILING__" {
-            let mut s = String::with_capacity(target_base_path.len() + 1);
-            s.push_str(target_base_path);
-            s.push('/');
-            s
-        } else {
-            joined_path.to_string()
-        };
-
-        let mut path_and_query_buf = final_path;
         if let Some(q) = query_part {
             path_and_query_buf.push('?');
             path_and_query_buf.push_str(q);
@@ -287,8 +351,8 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
 
         // Build the full URI
         UriBuilder::new()
-            .scheme(scheme)
-            .authority(authority.as_str())
+            .scheme(self.scheme.as_str())
+            .authority(self.authority.as_str())
             .path_and_query(path_and_query_buf.as_str())
             .build()
             .expect("Failed to build upstream URI")
@@ -344,9 +408,7 @@ mod tests {
 
     #[test]
     fn upstream_host_with_preserve_policy_uses_client_host() {
-        let policy = ProxyPolicy {
-            host_behaviour: HostBehaviour::Preserve,
-        };
+        let policy = ProxyPolicy::new().with_host_behaviour(HostBehaviour::Preserve);
         let headers = headers_with_host(Some("client.example.com"));
         assert_eq!(
             policy.forwarded_host(&headers, "upstream:8080".to_string()),
@@ -356,14 +418,18 @@ mod tests {
 
     #[test]
     fn upstream_host_with_preserve_policy_and_no_client_host_falls_back_to_authority() {
-        let policy = ProxyPolicy {
-            host_behaviour: HostBehaviour::Preserve,
-        };
+        let policy = ProxyPolicy::new().with_host_behaviour(HostBehaviour::Preserve);
         let headers = headers_with_host(None);
         assert_eq!(
             policy.forwarded_host(&headers, "upstream:8080".to_string()),
             "upstream:8080"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "must include an authority")]
+    fn invalid_target_panics_at_construction() {
+        let _ = ReverseProxy::new("/api", "/not-a-url");
     }
 
     #[test]

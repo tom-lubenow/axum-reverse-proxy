@@ -11,7 +11,7 @@
 //! use axum_reverse_proxy::{ProxyRouterExt, proxy_template};
 //!
 //! let app: Router = Router::new()
-//!     // Static target
+//!     // Static target: /api/foo/bar proxies to https://api.example.com/foo/bar
 //!     .proxy_route("/api/{*rest}", "https://api.example.com")
 //!     // Dynamic target with path parameter substitution
 //!     .proxy_route("/users/{id}/profile", proxy_template("https://profiles.example.com/user/{id}"));
@@ -25,11 +25,12 @@ use axum::{
     routing::any,
 };
 use http::uri::Builder as UriBuilder;
+use hyper_util::client::legacy::{Client, connect::Connect};
 use std::convert::Infallible;
 use tracing::{error, trace};
 
 use crate::{
-    forward::{ProxyClient, create_proxy_client, forward_request},
+    forward::{create_proxy_client, forward_request},
     proxy::ProxyPolicy,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -42,8 +43,11 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 ///
 /// # Built-in Implementations
 ///
-/// - `String` and `&'static str`: Static target URLs (request/parameters are ignored)
-/// - [`TemplateTarget`]: Template-based URL with `{param}` substitution
+/// - `String` and `&'static str`: Static *base* URLs. The part of the request
+///   path not covered by the route's literal prefix is appended to the target's
+///   path (see [`is_base_url`](TargetResolver::is_base_url)).
+/// - [`TemplateTarget`]: Template-based URL with `{param}` substitution; the
+///   resolved URL is used verbatim.
 ///
 /// # Example
 ///
@@ -81,17 +85,42 @@ pub trait TargetResolver: Clone + Send + Sync + 'static {
     ///
     /// The target URL as a string. This should be a valid URL including scheme and host.
     fn resolve(&self, req: &Request<Body>, params: &[(String, String)]) -> String;
+
+    /// Whether the resolved URL is a *base* URL that the request's remaining
+    /// path should be appended to.
+    ///
+    /// When `true`, the route's literal prefix (everything before the first
+    /// path parameter, e.g. `/api` in `/api/{*rest}`) is stripped from the
+    /// request path and the remainder is appended to the resolved URL's path —
+    /// the same joining behaviour as
+    /// [`ReverseProxy`](crate::ReverseProxy). When `false` (the default), the
+    /// resolved URL's path is used verbatim.
+    ///
+    /// The built-in `String` and `&'static str` resolvers return `true`;
+    /// [`TemplateTarget`] and custom resolvers default to `false` since they
+    /// construct the full upstream path themselves.
+    fn is_base_url(&self) -> bool {
+        false
+    }
 }
 
 impl TargetResolver for String {
     fn resolve(&self, _req: &Request<Body>, _params: &[(String, String)]) -> String {
         self.clone()
     }
+
+    fn is_base_url(&self) -> bool {
+        true
+    }
 }
 
 impl TargetResolver for &'static str {
     fn resolve(&self, _req: &Request<Body>, _params: &[(String, String)]) -> String {
         (*self).to_string()
+    }
+
+    fn is_base_url(&self) -> bool {
+        true
     }
 }
 
@@ -189,9 +218,10 @@ pub trait ProxyRouterExt<S> {
     /// Add a proxy route that forwards requests to a target URL.
     ///
     /// The target can be:
-    /// - A static string (`&str` or `String`)
-    /// - A [`TemplateTarget`] for dynamic URL generation based on path parameters
-    /// - Any custom type implementing [`TargetResolver`]
+    /// - A static string (`&str` or `String`), treated as a base URL: the part
+    ///   of the request path beyond the route's literal prefix is appended
+    /// - A [`TargetResolver`] such as [`TemplateTarget`] for dynamic URL
+    ///   generation, used verbatim
     ///
     /// # Arguments
     ///
@@ -205,7 +235,7 @@ pub trait ProxyRouterExt<S> {
     /// use axum_reverse_proxy::{ProxyRouterExt, proxy_template};
     ///
     /// let app: Router = Router::new()
-    ///     // Static proxy
+    ///     // Static proxy: /api/foo -> https://api.example.com/foo
     ///     .proxy_route("/api/{*rest}", "https://api.example.com")
     ///     // Dynamic proxy with path substitution
     ///     .proxy_route("/users/{id}", proxy_template("https://users.example.com/{id}"));
@@ -228,20 +258,45 @@ pub trait ProxyRouterExt<S> {
         path: &str,
         target: T,
         policy: ProxyPolicy,
-    ) -> Self;
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.proxy_route_with_client(path, target, policy, create_proxy_client())
+    }
+
+    /// Add a proxy route using a caller-supplied HTTP client.
+    ///
+    /// Use this to share one connection pool across routes or to customize
+    /// connector/client settings.
+    fn proxy_route_with_client<T: TargetResolver, C>(
+        self,
+        path: &str,
+        target: T,
+        policy: ProxyPolicy,
+        client: Client<C, Body>,
+    ) -> Self
+    where
+        C: Connect + Clone + Send + Sync + 'static;
 }
 
 impl<S> ProxyRouterExt<S> for Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    fn proxy_route_with_policy<T: TargetResolver>(
+    fn proxy_route_with_client<T: TargetResolver, C>(
         self,
         path: &str,
         target: T,
         policy: ProxyPolicy,
-    ) -> Self {
-        let client = create_proxy_client();
+        client: Client<C, Body>,
+    ) -> Self
+    where
+        C: Connect + Clone + Send + Sync + 'static,
+    {
+        // Literal prefix of the route pattern (up to the first path
+        // parameter), used to compute the remaining path for base-URL targets.
+        let route_prefix: String = route_literal_prefix(path).to_string();
 
         self.route(
             path,
@@ -250,20 +305,52 @@ where
                     let target = target.clone();
                     let client = client.clone();
                     let policy = policy.clone();
-                    async move { proxy_request(target, params, req, client, &policy).await }
+                    let route_prefix = route_prefix.clone();
+                    async move {
+                        proxy_request(target, params, req, client, &policy, &route_prefix).await
+                    }
                 },
             ),
         )
     }
 }
 
-async fn proxy_request<T: TargetResolver>(
+/// The literal prefix of a route pattern: everything before the first path
+/// parameter, without a trailing slash. E.g. `/api/{*rest}` -> `/api`.
+fn route_literal_prefix(pattern: &str) -> &str {
+    let literal = match pattern.find('{') {
+        Some(idx) => &pattern[..idx],
+        None => pattern,
+    };
+    literal.trim_end_matches('/')
+}
+
+/// Strip the route's literal prefix from a request path at a segment boundary.
+/// Returns the remainder (empty or `/`-prefixed), or the full path when the
+/// prefix doesn't apply.
+fn strip_route_prefix<'a>(path: &'a str, prefix: &str) -> &'a str {
+    if prefix.is_empty() {
+        return path;
+    }
+    if let Some(rem) = path.strip_prefix(prefix)
+        && (rem.is_empty() || rem.starts_with('/'))
+    {
+        return rem;
+    }
+    path
+}
+
+async fn proxy_request<T: TargetResolver, C>(
     target: T,
     params: Vec<(String, String)>,
     req: Request<Body>,
-    client: ProxyClient,
+    client: Client<C, Body>,
     policy: &ProxyPolicy,
-) -> Result<Response<Body>, Infallible> {
+    route_prefix: &str,
+) -> Result<Response<Body>, Infallible>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
     let target_url = target.resolve(&req, &params);
     trace!("Proxying request to resolved target: {}", target_url);
 
@@ -274,13 +361,30 @@ async fn proxy_request<T: TargetResolver>(
             error!("Invalid target URL '{}': {}", target_url, e);
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from(format!("Invalid target URL: {e}")))
+                .body(Body::from("Invalid proxy target"))
                 .unwrap());
         }
     };
 
+    // For base-URL targets, append the request path beyond the route's
+    // literal prefix to the target's path.
+    let append_path = if target.is_base_url() {
+        Some(strip_route_prefix(req.uri().path(), route_prefix))
+    } else {
+        None
+    };
+
     // Build the upstream URI, preserving query string from original request
-    let upstream_uri = build_upstream_uri(&target_uri, req.uri());
+    let upstream_uri = match build_upstream_uri(&target_uri, req.uri(), append_path) {
+        Ok(uri) => uri,
+        Err(e) => {
+            error!("Failed to build upstream URI from '{}': {}", target_url, e);
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("Invalid proxy target"))
+                .unwrap());
+        }
+    };
 
     // Use shared forwarding logic
     forward_request(upstream_uri, req, &client, policy).await
@@ -288,22 +392,36 @@ async fn proxy_request<T: TargetResolver>(
 
 /// Build the upstream URI from the target and original request.
 ///
-/// If the original request has a query string and the target doesn't,
-/// the query string is appended to the target.
-fn build_upstream_uri(target: &Uri, original: &Uri) -> Uri {
+/// When `append_path` is given (base-URL targets), it is joined onto the
+/// target's path. The query string is the target's own, falling back to the
+/// original request's.
+fn build_upstream_uri(
+    target: &Uri,
+    original: &Uri,
+    append_path: Option<&str>,
+) -> Result<Uri, String> {
     let scheme = target.scheme_str().unwrap_or("http");
     let authority = target
         .authority()
         .map(|a| a.as_str())
-        .unwrap_or("localhost");
-    let path = target.path();
+        .ok_or_else(|| "target URL has no authority (host)".to_string())?;
+
+    let path = match append_path {
+        None | Some("") => target.path().to_string(),
+        Some(rest) => {
+            // `rest` starts with '/'; trim the target's trailing slash (and
+            // treat a bare "/" as empty) so joining never doubles a slash.
+            let base = target.path().trim_end_matches('/');
+            format!("{base}{rest}")
+        }
+    };
 
     // Combine query strings: prefer target's query, fall back to original's
     let query = target.query().or_else(|| original.query());
 
     let path_and_query = match query {
         Some(q) => format!("{}?{}", path, q),
-        None => path.to_string(),
+        None => path,
     };
 
     UriBuilder::new()
@@ -311,7 +429,7 @@ fn build_upstream_uri(target: &Uri, original: &Uri) -> Uri {
         .authority(authority)
         .path_and_query(path_and_query)
         .build()
-        .expect("Failed to build upstream URI")
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -328,6 +446,7 @@ mod tests {
         let req = dummy_request();
         let params = vec![("id".to_string(), "123".to_string())];
         assert_eq!(resolver.resolve(&req, &params), "https://example.com");
+        assert!(resolver.is_base_url());
     }
 
     #[test]
@@ -336,6 +455,7 @@ mod tests {
         let req = dummy_request();
         let params = vec![("id".to_string(), "123".to_string())];
         assert_eq!(resolver.resolve(&req, &params), "https://example.com");
+        assert!(resolver.is_base_url());
     }
 
     #[test]
@@ -347,6 +467,7 @@ mod tests {
             resolver.resolve(&req, &params),
             "https://example.com/users/123"
         );
+        assert!(!resolver.is_base_url());
     }
 
     #[test]
@@ -387,10 +508,19 @@ mod tests {
     }
 
     #[test]
+    fn test_route_literal_prefix() {
+        assert_eq!(route_literal_prefix("/api/{*rest}"), "/api");
+        assert_eq!(route_literal_prefix("/users/{id}/profile"), "/users");
+        assert_eq!(route_literal_prefix("/proxy"), "/proxy");
+        assert_eq!(route_literal_prefix("/{*rest}"), "");
+        assert_eq!(route_literal_prefix("/"), "");
+    }
+
+    #[test]
     fn test_build_upstream_uri_with_target_query() {
         let target: Uri = "https://example.com/path?foo=bar".parse().unwrap();
         let original: Uri = "/request?baz=qux".parse().unwrap();
-        let result = build_upstream_uri(&target, &original);
+        let result = build_upstream_uri(&target, &original, None).unwrap();
         // Target query takes precedence
         assert_eq!(result.to_string(), "https://example.com/path?foo=bar");
     }
@@ -399,7 +529,7 @@ mod tests {
     fn test_build_upstream_uri_with_original_query() {
         let target: Uri = "https://example.com/path".parse().unwrap();
         let original: Uri = "/request?baz=qux".parse().unwrap();
-        let result = build_upstream_uri(&target, &original);
+        let result = build_upstream_uri(&target, &original, None).unwrap();
         // Falls back to original query
         assert_eq!(result.to_string(), "https://example.com/path?baz=qux");
     }
@@ -408,8 +538,36 @@ mod tests {
     fn test_build_upstream_uri_no_query() {
         let target: Uri = "https://example.com/path".parse().unwrap();
         let original: Uri = "/request".parse().unwrap();
-        let result = build_upstream_uri(&target, &original);
+        let result = build_upstream_uri(&target, &original, None).unwrap();
         assert_eq!(result.to_string(), "https://example.com/path");
+    }
+
+    #[test]
+    fn test_build_upstream_uri_appends_remaining_path() {
+        let target: Uri = "https://example.com".parse().unwrap();
+        let original: Uri = "/api/foo/bar?x=1".parse().unwrap();
+        let result = build_upstream_uri(&target, &original, Some("/foo/bar")).unwrap();
+        assert_eq!(result.to_string(), "https://example.com/foo/bar?x=1");
+
+        let target: Uri = "https://example.com/v2/".parse().unwrap();
+        let result = build_upstream_uri(&target, &original, Some("/foo/bar")).unwrap();
+        assert_eq!(result.to_string(), "https://example.com/v2/foo/bar?x=1");
+    }
+
+    #[test]
+    fn test_build_upstream_uri_rejects_missing_authority() {
+        let target: Uri = "/just-a-path".parse().unwrap();
+        let original: Uri = "/request".parse().unwrap();
+        assert!(build_upstream_uri(&target, &original, None).is_err());
+    }
+
+    #[test]
+    fn test_strip_route_prefix() {
+        assert_eq!(strip_route_prefix("/api/foo", "/api"), "/foo");
+        assert_eq!(strip_route_prefix("/api", "/api"), "");
+        assert_eq!(strip_route_prefix("/apifoo", "/api"), "/apifoo");
+        assert_eq!(strip_route_prefix("/other", "/api"), "/other");
+        assert_eq!(strip_route_prefix("/anything", ""), "/anything");
     }
 
     #[test]

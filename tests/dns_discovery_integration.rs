@@ -35,7 +35,7 @@ async fn test_dns_discovery_insert_and_proxy_update() {
     // Create proxy using the discovery
     let connector = HttpConnector::new();
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
-    let mut proxy = DiscoverableBalancedProxy::new_with_client("/", client, proxy_discovery);
+    let proxy = DiscoverableBalancedProxy::new_with_client("/", client, proxy_discovery);
 
     proxy.start_discovery().await;
     // wait briefly for discovery task to populate

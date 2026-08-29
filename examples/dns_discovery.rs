@@ -47,7 +47,7 @@ async fn main() {
         .build(connector);
 
     // Create the discoverable balanced proxy with DNS discovery
-    let mut proxy = DiscoverableBalancedProxy::new_with_client("/api", client, discovery);
+    let proxy = DiscoverableBalancedProxy::new_with_client("/api", client, discovery);
 
     // Start the discovery process
     proxy.start_discovery().await;

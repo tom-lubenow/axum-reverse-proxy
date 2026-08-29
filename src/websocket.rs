@@ -155,8 +155,19 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
 
     // sec-websocket-extensions is stripped because the proxy forwards frames
     // verbatim and cannot honour negotiated extensions (e.g. permessage-deflate).
+    // Non-WebSocket hop-by-hop headers are stripped per RFC 9110 §7.6.1
+    // (`connection`/`upgrade` stay: the upstream handshake needs them).
+    const SKIPPED: &[&str] = &[
+        "host",
+        "sec-websocket-extensions",
+        "keep-alive",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+    ];
     for (key, value) in req.headers() {
-        if key == "host" || key == "sec-websocket-extensions" {
+        if SKIPPED.contains(&key.as_str()) {
             continue;
         }
         request = request.header(key.as_str(), value);
@@ -168,9 +179,10 @@ pub(crate) async fn handle_websocket_with_upstream_uri(
     // Connect to upstream WebSocket BEFORE returning 101 to the client.
     // This ensures we only tell the client the upgrade succeeded if the
     // upstream actually accepted the WebSocket connection.
-    let (upstream_ws, upstream_response) = timeout(Duration::from_secs(5), connect_async(request))
-        .await
-        .map_err(|_| "Upstream WebSocket connection timed out")??;
+    let (upstream_ws, upstream_response) =
+        timeout(policy.websocket_connect_timeout, connect_async(request))
+            .await
+            .map_err(|_| "Upstream WebSocket connection timed out")??;
 
     trace!("Upstream WebSocket connected successfully");
 
@@ -251,9 +263,11 @@ async fn handle_websocket_bridge(
         while let Some(msg) = client_receiver.next().await {
             let msg = msg?;
             match msg {
-                Message::Close(_) => {
+                // Forward the close frame verbatim so the peer sees the
+                // original close code and reason.
+                Message::Close(frame) => {
                     if !client_closed {
-                        upstream_sender.send(Message::Close(None)).await?;
+                        upstream_sender.send(Message::Close(frame)).await?;
                         close_tx.send(()).await.ok();
                         client_closed = true;
                         break;
@@ -282,9 +296,11 @@ async fn handle_websocket_bridge(
         while let Some(msg) = upstream_receiver.next().await {
             let msg = msg?;
             match msg {
-                Message::Close(_) => {
+                // Forward the close frame verbatim so the peer sees the
+                // original close code and reason.
+                Message::Close(frame) => {
                     if !upstream_closed {
-                        client_sender.send(Message::Close(None)).await?;
+                        client_sender.send(Message::Close(frame)).await?;
                         close_tx_upstream.send(()).await.ok();
                         upstream_closed = true;
                         break;

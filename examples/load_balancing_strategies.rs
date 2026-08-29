@@ -57,7 +57,7 @@ async fn create_proxy_with_strategy(
         .build(connector);
 
     // Create the discoverable balanced proxy with the specified strategy
-    let mut proxy = DiscoverableBalancedProxy::new_with_client_and_strategy(
+    let proxy = DiscoverableBalancedProxy::new_with_client_and_strategy(
         path,
         client,
         discovery_stream,

@@ -21,7 +21,7 @@ async fn test_proxy_timeout() {
     });
 
     // Create a reverse proxy
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
     let app: Router = proxy.into();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -114,7 +114,7 @@ async fn test_proxy_upstream_errors() {
     });
 
     // Create a reverse proxy
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
     let app: Router = proxy.into();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

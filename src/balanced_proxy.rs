@@ -1,18 +1,16 @@
 use axum::body::Body;
 use hyper_util::client::legacy::{Client, connect::Connect};
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tower::discover::{Change, Discover};
 use tracing::{debug, error, trace, warn};
 
 use crate::forward::{ProxyConnector, create_http_connector};
-use crate::proxy::ReverseProxy;
+use crate::proxy::{ProxyPolicy, ReverseProxy};
 
-// For custom P2C implementation
 use rand::Rng;
 
 /// Load balancing strategy for distributing requests across discovered services
@@ -73,6 +71,17 @@ where
         }
     }
 
+    /// Apply a [`ProxyPolicy`] to every upstream of this proxy.
+    #[must_use]
+    pub fn with_policy(mut self, policy: ProxyPolicy) -> Self {
+        self.proxies = self
+            .proxies
+            .into_iter()
+            .map(|p| p.with_policy(policy.clone()))
+            .collect();
+        self
+    }
+
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -122,6 +131,25 @@ where
     }
 }
 
+/// A single discovered upstream: its proxy plus the load metrics used by the
+/// P2C strategies. Metrics travel with the endpoint, so service removals and
+/// re-inserts can never attribute one endpoint's load to another.
+struct Endpoint<C: Connect + Clone + Send + Sync + 'static> {
+    proxy: ReverseProxy<C>,
+    metrics: Arc<ServiceMetrics>,
+}
+
+impl<C: Connect + Clone + Send + Sync + 'static> Clone for Endpoint<C> {
+    fn clone(&self) -> Self {
+        Self {
+            proxy: self.proxy.clone(),
+            metrics: Arc::clone(&self.metrics),
+        }
+    }
+}
+
+type Snapshot<C> = Arc<Vec<Endpoint<C>>>;
+
 /// A balanced proxy that supports dynamic service discovery.
 ///
 /// This proxy uses the tower::discover trait to dynamically add and remove
@@ -130,7 +158,7 @@ where
 /// Features:
 /// - High-performance request handling with minimal overhead
 /// - Atomic service updates that don't block ongoing requests
-/// - Efficient round-robin load balancing
+/// - Round-robin and Power-of-Two-Choices load balancing
 /// - Zero-downtime service discovery changes
 #[derive(Clone)]
 pub struct DiscoverableBalancedProxy<C, D>
@@ -143,13 +171,12 @@ where
 {
     path: String,
     client: Client<C, Body>,
-    proxies_snapshot: Arc<std::sync::RwLock<Arc<Vec<ReverseProxy<C>>>>>,
-    proxy_keys: Arc<tokio::sync::RwLock<HashMap<D::Key, usize>>>, // key -> index mapping
+    snapshot: Arc<std::sync::RwLock<Snapshot<C>>>,
     counter: Arc<AtomicUsize>,
     discover: D,
     strategy: LoadBalancingStrategy,
-    // Custom P2C balancer for strategies that need it
-    p2c_balancer: Option<Arc<CustomP2cBalancer<C>>>,
+    policy: ProxyPolicy,
+    discovery_started: Arc<AtomicBool>,
 }
 
 pub type StandardDiscoverableBalancedProxy<D> = DiscoverableBalancedProxy<ProxyConnector, D>;
@@ -181,30 +208,27 @@ where
     where
         S: Into<String>,
     {
-        let path = path.into();
-        let proxies_snapshot = Arc::new(std::sync::RwLock::new(Arc::new(Vec::new())));
-
-        // Create P2C balancer if needed
-        let p2c_balancer = match strategy {
-            LoadBalancingStrategy::P2cPendingRequests | LoadBalancingStrategy::P2cPeakEwma => {
-                Some(Arc::new(CustomP2cBalancer::new(
-                    strategy,
-                    Arc::clone(&proxies_snapshot),
-                )))
-            }
-            LoadBalancingStrategy::RoundRobin => None,
-        };
-
         Self {
-            path,
+            path: path.into(),
             client,
-            proxies_snapshot,
-            proxy_keys: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            snapshot: Arc::new(std::sync::RwLock::new(Arc::new(Vec::new()))),
             counter: Arc::new(AtomicUsize::new(0)),
-            discover: discover.clone(),
+            discover,
             strategy,
-            p2c_balancer,
+            policy: ProxyPolicy::default(),
+            discovery_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Apply a [`ProxyPolicy`] to every discovered upstream.
+    ///
+    /// Must be called before [`start_discovery`](Self::start_discovery);
+    /// endpoints discovered earlier keep the policy in effect at the time they
+    /// were added.
+    #[must_use]
+    pub fn with_policy(mut self, policy: ProxyPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Get the base path this proxy is configured to handle
@@ -218,85 +242,70 @@ where
     }
 
     /// Start the discovery process in the background.
-    /// This should be called once to begin monitoring for service changes.
-    pub async fn start_discovery(&mut self) {
+    ///
+    /// Subsequent calls (on this instance or any clone) are no-ops: the
+    /// discovery stream is consumed by a single background task.
+    pub async fn start_discovery(&self) {
+        if self.discovery_started.swap(true, Ordering::SeqCst) {
+            warn!("start_discovery called more than once; ignoring");
+            return;
+        }
+
         let discover = self.discover.clone();
-        let proxies_snapshot = Arc::clone(&self.proxies_snapshot);
-        let proxy_keys = Arc::clone(&self.proxy_keys);
+        let snapshot = Arc::clone(&self.snapshot);
         let client = self.client.clone();
         let path = self.path.clone();
+        let policy = self.policy.clone();
 
         tokio::spawn(async move {
             use futures_util::future::poll_fn;
 
             let mut discover = Box::pin(discover);
+            // Insertion-ordered list of discovered endpoints, owned by this
+            // task. The service snapshot is rebuilt from it on every change.
+            let mut endpoints: Vec<(D::Key, Endpoint<C>)> = Vec::new();
 
             loop {
                 let change_result =
                     poll_fn(|cx: &mut Context<'_>| discover.as_mut().poll_discover(cx)).await;
 
                 match change_result {
-                    Some(Ok(change)) => match change {
-                        Change::Insert(key, service) => {
-                            let target: String = service.into();
-                            debug!("Discovered new service: {:?} -> {}", key, target);
+                    Some(Ok(change)) => {
+                        match change {
+                            Change::Insert(key, service) => {
+                                let target: String = service.into();
+                                debug!("Discovered service: {:?} -> {}", key, target);
 
-                            let proxy =
-                                ReverseProxy::new_with_client(path.clone(), target, client.clone());
-
-                            {
-                                let mut keys_guard = proxy_keys.write().await;
-
-                                // Get current snapshot and create new one with added service
-                                let current_snapshot = {
-                                    let snapshot_guard = proxies_snapshot.read().unwrap();
-                                    Arc::clone(&*snapshot_guard)
+                                let endpoint = Endpoint {
+                                    proxy: ReverseProxy::new_with_client(
+                                        path.clone(),
+                                        target,
+                                        client.clone(),
+                                    )
+                                    .with_policy(policy.clone()),
+                                    metrics: Arc::new(ServiceMetrics::new()),
                                 };
 
-                                let mut new_proxies = (*current_snapshot).clone();
-                                let index = new_proxies.len();
-                                new_proxies.push(proxy);
-                                keys_guard.insert(key, index);
-
-                                // Atomically update the snapshot
+                                // Per tower's Discover contract, an Insert for
+                                // an existing key replaces that service.
+                                if let Some(existing) =
+                                    endpoints.iter_mut().find(|(k, _)| *k == key)
                                 {
-                                    let mut snapshot_guard = proxies_snapshot.write().unwrap();
-                                    *snapshot_guard = Arc::new(new_proxies);
+                                    existing.1 = endpoint;
+                                } else {
+                                    endpoints.push((key, endpoint));
                                 }
                             }
-                        }
-                        Change::Remove(key) => {
-                            debug!("Removing service: {:?}", key);
-
-                            {
-                                let mut keys_guard = proxy_keys.write().await;
-
-                                if let Some(index) = keys_guard.remove(&key) {
-                                    // Get current snapshot and create new one with removed service
-                                    let current_snapshot = {
-                                        let snapshot_guard = proxies_snapshot.read().unwrap();
-                                        Arc::clone(&*snapshot_guard)
-                                    };
-
-                                    let mut new_proxies = (*current_snapshot).clone();
-                                    new_proxies.remove(index);
-
-                                    // Update indices for all keys after the removed index
-                                    for (_, idx) in keys_guard.iter_mut() {
-                                        if *idx > index {
-                                            *idx -= 1;
-                                        }
-                                    }
-
-                                    // Atomically update the snapshot
-                                    {
-                                        let mut snapshot_guard = proxies_snapshot.write().unwrap();
-                                        *snapshot_guard = Arc::new(new_proxies);
-                                    }
-                                }
+                            Change::Remove(key) => {
+                                debug!("Removing service: {:?}", key);
+                                endpoints.retain(|(k, _)| *k != key);
                             }
                         }
-                    },
+
+                        let new_snapshot: Snapshot<C> =
+                            Arc::new(endpoints.iter().map(|(_, e)| e.clone()).collect());
+                        *snapshot.write().unwrap() = new_snapshot;
+                    }
                     Some(Err(e)) => {
                         error!("Discovery error: {:?}", e);
                     }
@@ -311,11 +320,11 @@ where
 
     /// Get the current number of discovered services
     pub async fn service_count(&self) -> usize {
-        let snapshot = {
-            let guard = self.proxies_snapshot.read().unwrap();
-            Arc::clone(&*guard)
-        };
-        snapshot.len()
+        self.snapshot.read().unwrap().len()
+    }
+
+    fn current_snapshot(&self) -> Snapshot<C> {
+        Arc::clone(&self.snapshot.read().unwrap())
     }
 }
 
@@ -336,238 +345,78 @@ where
     }
 
     fn call(&mut self, req: axum::http::Request<Body>) -> Self::Future {
-        // Get current proxy snapshot
-        let proxies_snapshot = {
-            let guard = self.proxies_snapshot.read().unwrap();
-            Arc::clone(&*guard)
-        };
+        let snapshot = self.current_snapshot();
         let counter = Arc::clone(&self.counter);
         let strategy = self.strategy;
-        let p2c_balancer = self.p2c_balancer.clone();
 
         Box::pin(async move {
-            match strategy {
+            if snapshot.is_empty() {
+                warn!("No upstream services available");
+                return Ok(axum::http::Response::builder()
+                    .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Body::from("No upstream services available"))
+                    .unwrap());
+            }
+
+            let idx = match strategy {
                 LoadBalancingStrategy::RoundRobin => {
-                    // Round-robin load balancing
-                    if proxies_snapshot.is_empty() {
-                        warn!("No upstream services available");
-                        Ok(axum::http::Response::builder()
-                            .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
-                            .body(Body::from("No upstream services available"))
-                            .unwrap())
-                    } else {
-                        let idx = counter.fetch_add(1, Ordering::Relaxed) % proxies_snapshot.len();
-                        let mut proxy = proxies_snapshot[idx].clone();
-                        proxy.call(req).await
-                    }
+                    counter.fetch_add(1, Ordering::Relaxed) % snapshot.len()
                 }
                 LoadBalancingStrategy::P2cPendingRequests | LoadBalancingStrategy::P2cPeakEwma => {
-                    // Use the custom P2C balancer
-                    if let Some(balancer) = p2c_balancer {
-                        balancer.call_with_p2c(req).await
-                    } else {
-                        // Fallback to error if balancer is not available
-                        error!("P2C balancer not available for strategy {:?}", strategy);
-                        Ok(axum::http::Response::builder()
-                            .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
-                            .body(Body::from("P2C balancer not available"))
-                            .unwrap())
-                    }
+                    p2c_select(&snapshot, strategy)
                 }
+            };
+            let endpoint = &snapshot[idx];
+
+            // Track pending requests for the P2C pending-requests strategy;
+            // the guard decrements on drop (including panics/cancellation).
+            let _pending_guard = if strategy == LoadBalancingStrategy::P2cPendingRequests {
+                endpoint
+                    .metrics
+                    .pending_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(PendingRequestGuard {
+                    metrics: Arc::clone(&endpoint.metrics),
+                })
+            } else {
+                None
+            };
+
+            let start = Instant::now();
+            let mut proxy = endpoint.proxy.clone();
+            let result = proxy.call(req).await;
+
+            if strategy == LoadBalancingStrategy::P2cPeakEwma {
+                endpoint.metrics.update_ewma(start.elapsed());
             }
+
+            result
         })
     }
 }
 
-/// Custom P2C load balancer that uses atomic operations for low-contention metrics tracking
-struct CustomP2cBalancer<C: Connect + Clone + Send + Sync + 'static> {
+/// Pick an endpoint index using Power of Two Choices: sample two distinct
+/// endpoints at random and take the one with the lower load.
+fn p2c_select<C: Connect + Clone + Send + Sync + 'static>(
+    snapshot: &[Endpoint<C>],
     strategy: LoadBalancingStrategy,
-    proxies_snapshot: Arc<std::sync::RwLock<Arc<Vec<ReverseProxy<C>>>>>,
-    /// Metrics for each service, indexed by position in proxies_snapshot
-    /// We use Arc<Vec<Arc<ServiceMetrics>>> to allow concurrent access with minimal locking
-    metrics: Arc<std::sync::RwLock<Arc<Vec<Arc<ServiceMetrics>>>>>,
-}
-
-impl<C: Connect + Clone + Send + Sync + 'static> CustomP2cBalancer<C> {
-    fn new(
-        strategy: LoadBalancingStrategy,
-        proxies_snapshot: Arc<std::sync::RwLock<Arc<Vec<ReverseProxy<C>>>>>,
-    ) -> Self {
-        let initial_metrics = Arc::new(Vec::new());
-        Self {
-            strategy,
-            proxies_snapshot,
-            metrics: Arc::new(std::sync::RwLock::new(initial_metrics)),
-        }
+) -> usize {
+    if snapshot.len() == 1 {
+        return 0;
     }
-
-    async fn call_with_p2c(
-        &self,
-        req: axum::http::Request<Body>,
-    ) -> Result<axum::http::Response<Body>, Infallible> {
-        // Get current proxy snapshot
-        let proxies = {
-            let guard = self.proxies_snapshot.read().unwrap();
-            Arc::clone(&*guard)
-        };
-
-        if proxies.is_empty() {
-            return Ok(axum::http::Response::builder()
-                .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from("No upstream services available"))
-                .unwrap());
+    let mut rng = rand::rng();
+    let idx1 = rng.random_range(0..snapshot.len());
+    let idx2 = loop {
+        let i = rng.random_range(0..snapshot.len());
+        if i != idx1 {
+            break i;
         }
+    };
 
-        // Ensure metrics vector is up to date
-        self.ensure_metrics_size(proxies.len());
+    let load1 = snapshot[idx1].metrics.load(strategy);
+    let load2 = snapshot[idx2].metrics.load(strategy);
 
-        // Get metrics snapshot
-        let metrics = {
-            let guard = self.metrics.read().unwrap();
-            Arc::clone(&*guard)
-        };
-
-        // P2C: Pick two random services and choose the one with lower load
-        let selected_idx = if proxies.len() == 1 {
-            0
-        } else {
-            let mut rng = rand::rng();
-            let idx1 = rng.random_range(0..proxies.len());
-            let idx2 = loop {
-                let i = rng.random_range(0..proxies.len());
-                if i != idx1 {
-                    break i;
-                }
-            };
-
-            // Compare load metrics based on strategy
-            let load1 = self.get_load(&metrics[idx1]);
-            let load2 = self.get_load(&metrics[idx2]);
-
-            if load1 <= load2 { idx1 } else { idx2 }
-        };
-
-        // Track request start for pending requests
-        let request_guard = if matches!(self.strategy, LoadBalancingStrategy::P2cPendingRequests) {
-            metrics[selected_idx]
-                .pending_requests
-                .fetch_add(1, Ordering::Relaxed);
-            Some(PendingRequestGuard {
-                metrics: Arc::clone(&metrics[selected_idx]),
-            })
-        } else {
-            None
-        };
-
-        // Record start time for latency tracking
-        let start = Instant::now();
-
-        // Make the actual request
-        let mut proxy = proxies[selected_idx].clone();
-        let result = proxy.call(req).await;
-
-        // Update latency metrics for EWMA strategy
-        if matches!(self.strategy, LoadBalancingStrategy::P2cPeakEwma) {
-            let latency = start.elapsed();
-            self.update_ewma(&metrics[selected_idx], latency);
-        }
-
-        // Request guard will decrement pending count when dropped
-        drop(request_guard);
-
-        result
-    }
-
-    fn ensure_metrics_size(&self, size: usize) {
-        let mut metrics_guard = self.metrics.write().unwrap();
-        let current_metrics = Arc::clone(&*metrics_guard);
-
-        if current_metrics.len() != size {
-            let mut new_metrics = Vec::with_capacity(size);
-
-            // Copy existing metrics
-            for (i, metric) in current_metrics.iter().enumerate() {
-                if i < size {
-                    new_metrics.push(Arc::clone(metric));
-                }
-            }
-
-            // Add new metrics if needed
-            while new_metrics.len() < size {
-                new_metrics.push(Arc::new(ServiceMetrics::new()));
-            }
-
-            *metrics_guard = Arc::new(new_metrics);
-        }
-    }
-
-    fn get_load(&self, metrics: &ServiceMetrics) -> u64 {
-        match self.strategy {
-            LoadBalancingStrategy::P2cPendingRequests => {
-                metrics.pending_requests.load(Ordering::Relaxed) as u64
-            }
-            LoadBalancingStrategy::P2cPeakEwma => {
-                // Apply decay based on time since last update
-                let last_update = *metrics.last_update.lock().unwrap();
-                let elapsed = last_update.elapsed();
-
-                // Simple exponential decay: reduce by ~50% every 5 seconds
-                let current = metrics.peak_ewma_micros.load(Ordering::Relaxed);
-                let decay_factor = (-elapsed.as_secs_f64() / 5.0).exp();
-                (current as f64 * decay_factor) as u64
-            }
-            _ => unreachable!("CustomP2cBalancer should only be used with P2C strategies"),
-        }
-    }
-
-    fn update_ewma(&self, metrics: &ServiceMetrics, latency: Duration) {
-        let latency_micros = latency.as_micros() as u64;
-
-        // Update with exponential weighted moving average
-        // Using compare-and-swap loop for lock-free update
-        loop {
-            let current = metrics.peak_ewma_micros.load(Ordering::Relaxed);
-
-            // If this is the first measurement, just set it
-            if current == 0 {
-                if metrics
-                    .peak_ewma_micros
-                    .compare_exchange(0, latency_micros, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    *metrics.last_update.lock().unwrap() = Instant::now();
-                    break;
-                }
-                continue;
-            }
-
-            // Apply decay based on time since last update
-            let mut last_update_guard = metrics.last_update.lock().unwrap();
-            let elapsed = last_update_guard.elapsed();
-
-            // Decay factor: reduce by ~50% every 5 seconds
-            let decay_factor = (-elapsed.as_secs_f64() / 5.0).exp();
-            let decayed_current = (current as f64 * decay_factor) as u64;
-
-            // Peak EWMA: take the maximum of the decayed value and the new measurement
-            let peak = decayed_current.max(latency_micros);
-
-            // EWMA with alpha = 0.25 (25% new value, 75% old value)
-            // This gives more weight to recent measurements
-            let ewma = ((peak as f64 * 0.25) + (decayed_current as f64 * 0.75)) as u64;
-
-            if metrics
-                .peak_ewma_micros
-                .compare_exchange(current, ewma, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                // Update last update time
-                *last_update_guard = Instant::now();
-                break;
-            }
-            drop(last_update_guard); // Release lock before retrying
-        }
-    }
+    if load1 <= load2 { idx1 } else { idx2 }
 }
 
 /// RAII guard to decrement pending request count when request completes
@@ -600,6 +449,76 @@ impl ServiceMetrics {
             pending_requests: AtomicUsize::new(0),
             peak_ewma_micros: AtomicU64::new(0),
             last_update: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    fn load(&self, strategy: LoadBalancingStrategy) -> u64 {
+        match strategy {
+            LoadBalancingStrategy::P2cPendingRequests => {
+                self.pending_requests.load(Ordering::Relaxed) as u64
+            }
+            LoadBalancingStrategy::P2cPeakEwma => {
+                // Apply decay based on time since last update
+                let last_update = *self.last_update.lock().unwrap();
+                let elapsed = last_update.elapsed();
+
+                // Simple exponential decay: reduce by ~50% every 5 seconds
+                let current = self.peak_ewma_micros.load(Ordering::Relaxed);
+                let decay_factor = (-elapsed.as_secs_f64() / 5.0).exp();
+                (current as f64 * decay_factor) as u64
+            }
+            LoadBalancingStrategy::RoundRobin => {
+                unreachable!("load() is only used by P2C strategies")
+            }
+        }
+    }
+
+    fn update_ewma(&self, latency: Duration) {
+        let latency_micros = latency.as_micros() as u64;
+
+        // Update with exponential weighted moving average
+        // Using compare-and-swap loop for lock-free update
+        loop {
+            let current = self.peak_ewma_micros.load(Ordering::Relaxed);
+
+            // If this is the first measurement, just set it
+            if current == 0 {
+                if self
+                    .peak_ewma_micros
+                    .compare_exchange(0, latency_micros, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    *self.last_update.lock().unwrap() = Instant::now();
+                    break;
+                }
+                continue;
+            }
+
+            // Apply decay based on time since last update
+            let mut last_update_guard = self.last_update.lock().unwrap();
+            let elapsed = last_update_guard.elapsed();
+
+            // Decay factor: reduce by ~50% every 5 seconds
+            let decay_factor = (-elapsed.as_secs_f64() / 5.0).exp();
+            let decayed_current = (current as f64 * decay_factor) as u64;
+
+            // Peak EWMA: take the maximum of the decayed value and the new measurement
+            let peak = decayed_current.max(latency_micros);
+
+            // EWMA with alpha = 0.25 (25% new value, 75% old value)
+            // This gives more weight to recent measurements
+            let ewma = ((peak as f64 * 0.25) + (decayed_current as f64 * 0.75)) as u64;
+
+            if self
+                .peak_ewma_micros
+                .compare_exchange(current, ewma, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                // Update last update time
+                *last_update_guard = Instant::now();
+                break;
+            }
+            drop(last_update_guard); // Release lock before retrying
         }
     }
 }

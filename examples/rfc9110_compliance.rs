@@ -21,7 +21,7 @@ async fn main() {
     });
 
     // Create a reverse proxy with RFC9110 compliance
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
     let mut server_names = HashSet::new();
     server_names.insert("localhost".to_string());
     server_names.insert("127.0.0.1".to_string());

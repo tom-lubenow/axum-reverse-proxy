@@ -37,7 +37,7 @@ async fn test_proxy_with_middleware() {
     });
 
     // Create a reverse proxy
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
     let proxy_router: Router = proxy.into();
 
     // Add middleware stack
@@ -134,7 +134,7 @@ async fn test_proxy_timeout_middleware() {
     });
 
     // Create a reverse proxy with a short timeout
-    let proxy = ReverseProxy::new("/", &format!("http://{test_addr}"));
+    let proxy = ReverseProxy::new("/", format!("http://{test_addr}"));
     let proxy_router: Router = proxy.into();
 
     // Add timeout middleware
