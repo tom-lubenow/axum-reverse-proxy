@@ -1,442 +1,74 @@
-use axum::{
-    body::Body,
-    http::{Request, Response, Uri},
-};
-use futures_util::{SinkExt, stream::StreamExt};
-use http::{HeaderMap, HeaderValue, StatusCode};
+//! HTTP/1.1 WebSocket upgrades share the ordinary request transport.
+use http::{HeaderMap, HeaderValue};
+use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{
-        Error, Message,
-        handshake::{self, derive_accept_key},
-    },
-};
-use tracing::{error, trace};
-use url::{Host, Url};
 
-use crate::proxy::ProxyPolicy;
-
-/// Check if a request is a WebSocket upgrade request by examining the headers.
-///
-/// According to the WebSocket protocol specification (RFC 6455), a WebSocket upgrade request must have:
-/// - An "Upgrade: websocket" header (case-insensitive)
-/// - A "Connection: Upgrade" header (case-insensitive)
-/// - A "Sec-WebSocket-Key" header with a base64-encoded 16-byte value
-/// - A "Sec-WebSocket-Version" header
-pub(crate) fn is_websocket_upgrade(headers: &HeaderMap<HeaderValue>) -> bool {
-    // Check for required WebSocket upgrade headers
-    let has_upgrade = headers
-        .get("upgrade")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
-
-    let has_connection = headers
-        .get("connection")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
-        })
-        .unwrap_or(false);
-
-    let has_websocket_key = headers.contains_key("sec-websocket-key");
-    let has_websocket_version = headers.contains_key("sec-websocket-version");
-
-    trace!(
-        "is_websocket_upgrade - upgrade: {has_upgrade}, connection: {has_connection}, websocket key: {has_websocket_key}, websocket version: {has_websocket_version}"
-    );
-    has_upgrade && has_connection && has_websocket_key && has_websocket_version
+fn token(headers: &HeaderMap, name: &str, wanted: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|v| v.trim().eq_ignore_ascii_case(wanted))
 }
 
-/// Compute the host header value for a WebSocket URL.
-///
-/// Returns (host_header, port) where host_header includes the port only if non-default.
-fn compute_host_header_from_url(url: &Url) -> (String, u16) {
-    let scheme = url.scheme();
-    let host = match url.host() {
-        Some(Host::Ipv6(addr)) => format!("[{addr}]"),
-        Some(Host::Ipv4(addr)) => addr.to_string(),
-        Some(Host::Domain(s)) => s.to_string(),
-        None => "localhost".to_string(),
-    };
-    let port = match url.port() {
-        Some(p) => p,
-        None => {
-            if scheme == "wss" {
-                443
-            } else {
-                80
-            }
-        }
-    };
-    let header = if (scheme == "wss" && port == 443) || (scheme == "ws" && port == 80) {
-        host.clone()
-    } else {
-        format!("{host}:{port}")
-    };
-    (header, port)
+pub(crate) fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    token(headers, "connection", "upgrade")
+        && token(headers, "upgrade", "websocket")
+        && headers.contains_key("sec-websocket-key")
+        && headers.contains_key("sec-websocket-version")
 }
 
-#[cfg(test)]
-fn compute_host_header(url: &str) -> (String, u16) {
-    let url = Url::parse(url).unwrap();
-    compute_host_header_from_url(&url)
+pub(crate) fn upgrade_headers(headers: &mut HeaderMap) {
+    headers.insert("connection", HeaderValue::from_static("upgrade"));
+    headers.insert("upgrade", HeaderValue::from_static("websocket"));
 }
 
-/// Handle a WebSocket upgrade request by:
-/// 1. Validating the upgrade request
-/// 2. Computing the WebSocket accept key
-/// 3. Establishing a connection to the upstream server
-/// 4. Returning an upgrade response to the client
-/// 5. Spawning a task to bridge the client and upstream WebSocket connections
-///
-/// The upstream WebSocket connection is established **before** the 101 response is
-/// returned to the client. This ensures the client only receives a successful upgrade
-/// if the upstream server actually accepted the WebSocket connection.
-///
-/// `Sec-WebSocket-Extensions` headers are stripped when forwarding to upstream because
-/// the proxy performs frame-level forwarding (not raw byte forwarding) and cannot
-/// transparently handle extensions like `permessage-deflate`.
-///
-/// This function follows the WebSocket protocol specification (RFC 6455) for the upgrade handshake.
-/// It ensures that all required headers are properly handled and forwarded to the upstream server.
-pub(crate) async fn handle_websocket_with_upstream_uri(
-    req: Request<Body>,
-    upstream_http_uri: Uri,
-    policy: &ProxyPolicy,
-) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
-    trace!("Handling WebSocket upgrade request");
-
-    // Get the WebSocket key before upgrading
-    let ws_key = req
-        .headers()
-        .get("sec-websocket-key")
-        .and_then(|key| key.to_str().ok())
-        .ok_or("Missing or invalid Sec-WebSocket-Key header")?;
-
-    // Calculate the WebSocket accept key
-    let ws_accept = derive_accept_key(ws_key.as_bytes());
-
-    // Build a ws:// or wss:// URL from the provided upstream HTTP URI (which already
-    // has correct path+query joining applied)
-    let scheme = upstream_http_uri.scheme_str().unwrap_or("http");
-    let ws_scheme = match scheme {
-        "wss" | "ws" => scheme,
-        "https" => "wss",
-        _ => "ws",
+pub(crate) fn valid_upgrade_response(headers: &HeaderMap, request: &HeaderMap) -> bool {
+    let Some(key) = request.get("sec-websocket-key") else {
+        return false;
     };
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    token(headers, "connection", "upgrade")
+        && token(headers, "upgrade", "websocket")
+        && headers
+            .get("sec-websocket-accept")
+            .is_some_and(|v| v == accept.as_str())
+        && headers
+            .get("sec-websocket-protocol")
+            .is_none_or(|selected| {
+                selected.to_str().is_ok_and(|selected| {
+                    request
+                        .get_all("sec-websocket-protocol")
+                        .iter()
+                        .filter_map(|v| v.to_str().ok())
+                        .flat_map(|v| v.split(','))
+                        .any(|offered| offered.trim() == selected)
+                })
+            })
+}
 
-    let authority = upstream_http_uri
-        .authority()
-        .ok_or("Upstream URI missing authority")?
-        .as_str();
-    let path_q = upstream_http_uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let upstream_url = format!("{ws_scheme}://{authority}{path_q}");
-
-    trace!("Connecting to upstream WebSocket at {}", upstream_url);
-
-    // Parse the URL and compute the host header
-    let url = Url::parse(&upstream_url)?;
-    let (host_header, _port) = compute_host_header_from_url(&url);
-
-    let client_authority = req.uri().authority().map(|a| a.as_str().to_owned());
-    let upstream_host =
-        policy.forwarded_host(req.headers(), client_authority.as_deref(), host_header);
-
-    let mut request = handshake::client::Request::builder()
-        .uri(upstream_url)
-        .header("host", upstream_host);
-
-    // sec-websocket-extensions is stripped because the proxy forwards frames
-    // verbatim and cannot honour negotiated extensions (e.g. permessage-deflate).
-    // Non-WebSocket hop-by-hop headers are stripped per RFC 9110 §7.6.1
-    // (`connection`/`upgrade` stay: the upstream handshake needs them).
-    const SKIPPED: &[&str] = &[
-        "host",
-        "sec-websocket-extensions",
-        "keep-alive",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-    ];
-    for (key, value) in req.headers() {
-        if SKIPPED.contains(&key.as_str()) {
-            continue;
-        }
-        request = request.header(key.as_str(), value);
-    }
-
-    // Build the request
-    let request = request.body(())?;
-
-    // Connect to upstream WebSocket BEFORE returning 101 to the client.
-    // This ensures we only tell the client the upgrade succeeded if the
-    // upstream actually accepted the WebSocket connection.
-    let (upstream_ws, upstream_response) =
-        timeout(policy.websocket_connect_timeout, connect_async(request))
-            .await
-            .map_err(|_| "Upstream WebSocket connection timed out")??;
-
-    trace!("Upstream WebSocket connected successfully");
-
-    // Build 101 response for client
-    let mut response_builder = Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header("Upgrade", "websocket")
-        .header("Connection", "Upgrade")
-        .header("Sec-WebSocket-Accept", ws_accept);
-
-    // Forward negotiated sub-protocol from upstream if present
-    if let Some(protocol) = upstream_response.headers().get("sec-websocket-protocol") {
-        response_builder = response_builder.header("Sec-WebSocket-Protocol", protocol);
-    }
-
-    trace!("Returning upgrade response to client");
-    let response = response_builder.body(Body::empty())?;
-
-    // Spawn a task to bridge the client and upstream WebSocket connections
-    let (parts, body) = req.into_parts();
-    let req = Request::from_parts(parts, body);
+pub(crate) fn bridge(downstream: OnUpgrade, upstream: OnUpgrade) {
     tokio::spawn(async move {
-        match handle_websocket_bridge(req, upstream_ws).await {
-            Ok(_) => trace!("WebSocket connection closed gracefully"),
-            Err(e) => error!("WebSocket connection error: {}", e),
+        // Bound upgrade completion; on failure both sides are dropped together.
+        match timeout(Duration::from_secs(5), async {
+            tokio::try_join!(downstream, upstream)
+        })
+        .await
+        {
+            Ok(Ok((downstream, upstream))) => {
+                let mut downstream = TokioIo::new(downstream);
+                let mut upstream = TokioIo::new(upstream);
+                // Includes hyper's buffered bytes. EOF shuts down the opposite
+                // writer while the remaining direction drains; errors drop both.
+                if let Err(error) =
+                    tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await
+                {
+                    tracing::debug!(%error, "WebSocket tunnel closed");
+                }
+            }
+            result => tracing::debug!(?result, "WebSocket upgrade failed"),
         }
     });
-
-    Ok(response)
-}
-
-/// Bridge an upgraded client connection with an already-connected upstream WebSocket.
-///
-/// This function:
-/// 1. Completes the HTTP upgrade on the client connection
-/// 2. Wraps both connections as WebSocket streams
-/// 3. Creates two tasks for bidirectional message forwarding:
-///    - Client to upstream: forwards messages from the client to the upstream server
-///    - Upstream to client: forwards messages from the upstream server to the client
-/// 4. Handles various WebSocket message types:
-///    - Text messages
-///    - Binary messages
-///    - Ping/Pong messages
-///    - Close frames
-///
-/// The connection is maintained until either:
-/// - A close frame is received from either side
-/// - An error occurs in the connection
-/// - The connection is dropped
-///
-/// When a close frame is received, it is properly forwarded to ensure clean connection termination.
-async fn handle_websocket_bridge(
-    req: Request<Body>,
-    upstream_ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let upgraded = match timeout(Duration::from_secs(5), hyper::upgrade::on(req)).await {
-        Ok(Ok(upgraded)) => upgraded,
-        Ok(Err(e)) => return Err(Box::new(e)),
-        Err(e) => return Err(Box::new(e)),
-    };
-
-    let io = TokioIo::new(upgraded);
-    let client_ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-        io,
-        tokio_tungstenite::tungstenite::protocol::Role::Server,
-        None,
-    )
-    .await;
-
-    let (mut client_sender, mut client_receiver) = client_ws.split();
-    let (mut upstream_sender, mut upstream_receiver) = upstream_ws.split();
-
-    let (close_tx, mut close_rx) = mpsc::channel::<()>(1);
-    let close_tx_upstream = close_tx.clone();
-
-    let client_to_upstream = tokio::spawn(async move {
-        let mut client_closed = false;
-        while let Some(msg) = client_receiver.next().await {
-            let msg = msg?;
-            match msg {
-                // Forward the close frame verbatim so the peer sees the
-                // original close code and reason.
-                Message::Close(frame) => {
-                    if !client_closed {
-                        upstream_sender.send(Message::Close(frame)).await?;
-                        close_tx.send(()).await.ok();
-                        client_closed = true;
-                        break;
-                    }
-                }
-                msg @ Message::Binary(_)
-                | msg @ Message::Text(_)
-                | msg @ Message::Ping(_)
-                | msg @ Message::Pong(_) => {
-                    if !client_closed {
-                        upstream_sender.send(msg).await?;
-                    }
-                }
-                Message::Frame(_) => {}
-            }
-        }
-        if !client_closed {
-            upstream_sender.send(Message::Close(None)).await?;
-            close_tx.send(()).await.ok();
-        }
-        Ok::<_, Error>(())
-    });
-
-    let upstream_to_client = tokio::spawn(async move {
-        let mut upstream_closed = false;
-        while let Some(msg) = upstream_receiver.next().await {
-            let msg = msg?;
-            match msg {
-                // Forward the close frame verbatim so the peer sees the
-                // original close code and reason.
-                Message::Close(frame) => {
-                    if !upstream_closed {
-                        client_sender.send(Message::Close(frame)).await?;
-                        close_tx_upstream.send(()).await.ok();
-                        upstream_closed = true;
-                        break;
-                    }
-                }
-                msg @ Message::Binary(_)
-                | msg @ Message::Text(_)
-                | msg @ Message::Ping(_)
-                | msg @ Message::Pong(_) => {
-                    if !upstream_closed {
-                        client_sender.send(msg).await?;
-                    }
-                }
-                Message::Frame(_) => {}
-            }
-        }
-        if !upstream_closed {
-            client_sender.send(Message::Close(None)).await?;
-            close_tx_upstream.send(()).await.ok();
-        }
-        Ok::<_, Error>(())
-    });
-
-    tokio::select! {
-        _ = close_rx.recv() => {
-            trace!("WebSocket connection closed gracefully");
-        }
-        res = client_to_upstream => {
-            if let Err(e) = res {
-                error!("Client to upstream task failed: {:?}", e);
-            }
-        }
-        res = upstream_to_client => {
-            if let Err(e) = res {
-                error!("Upstream to client task failed: {:?}", e);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{compute_host_header, is_websocket_upgrade};
-    use http::{HeaderMap, HeaderValue};
-
-    #[test]
-    fn host_header_ws_default_port() {
-        let (host, port) = compute_host_header("ws://example.com/path");
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 80);
-    }
-
-    #[test]
-    fn host_header_wss_default_port() {
-        let (host, port) = compute_host_header("wss://example.com/path");
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 443);
-    }
-
-    #[test]
-    fn host_header_wss_custom_port() {
-        let (host, port) = compute_host_header("wss://example.com:8443/path");
-        assert_eq!(host, "example.com:8443");
-        assert_eq!(port, 8443);
-    }
-
-    #[test]
-    fn websocket_upgrade_valid_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert("Upgrade", HeaderValue::from_static("websocket"));
-        headers.insert(
-            "Connection",
-            HeaderValue::from_static("keep-alive, Upgrade"),
-        );
-        headers.insert(
-            "Sec-WebSocket-Key",
-            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
-        );
-        headers.insert("Sec-WebSocket-Version", HeaderValue::from_static("13"));
-
-        assert!(is_websocket_upgrade(&headers));
-    }
-
-    #[test]
-    fn websocket_upgrade_missing_upgrade_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert("Connection", HeaderValue::from_static("Upgrade"));
-        headers.insert(
-            "Sec-WebSocket-Key",
-            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
-        );
-        headers.insert("Sec-WebSocket-Version", HeaderValue::from_static("13"));
-
-        assert!(!is_websocket_upgrade(&headers));
-    }
-
-    #[test]
-    fn websocket_upgrade_invalid_connection_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert("Upgrade", HeaderValue::from_static("websocket"));
-        headers.insert("Connection", HeaderValue::from_static("keep-alive"));
-        headers.insert(
-            "Sec-WebSocket-Key",
-            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
-        );
-        headers.insert("Sec-WebSocket-Version", HeaderValue::from_static("13"));
-
-        assert!(!is_websocket_upgrade(&headers));
-    }
-
-    #[test]
-    fn websocket_upgrade_missing_key_or_version() {
-        let mut headers = HeaderMap::new();
-        headers.insert("Upgrade", HeaderValue::from_static("websocket"));
-        headers.insert("Connection", HeaderValue::from_static("Upgrade"));
-
-        // Missing Sec-WebSocket-Key
-        headers.insert("Sec-WebSocket-Version", HeaderValue::from_static("13"));
-        assert!(!is_websocket_upgrade(&headers));
-
-        headers.insert(
-            "Sec-WebSocket-Key",
-            HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
-        );
-        headers.remove("Sec-WebSocket-Version");
-        assert!(!is_websocket_upgrade(&headers));
-    }
-
-    #[test]
-    fn host_header_ipv6_with_port() {
-        let (host, port) = compute_host_header("ws://[::1]:9000/path");
-        assert_eq!(host, "[::1]:9000");
-        assert_eq!(port, 9000);
-    }
 }
