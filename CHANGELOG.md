@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-10-31
+
+### Added
+
+- `proxy_request_on_stream`: one HTTP/1.1 request over a caller-authorized
+  stream, without connecting, pooling, retrying, or falling back. Supports
+  streaming bodies and WebSocket upgrades.
+
+### Fixed
+
+- WebSockets now use the configured hyper client/connector and its TLS settings.
+  Upgraded connections copy bytes transparently, preserving negotiated
+  subprotocols, extensions, buffered bytes, and half-close semantics.
+- WebSocket requests use the shared forwarding policy and hop-by-hop header
+  sanitation. Upstream non-101 responses are forwarded instead of replaced by
+  502; handshake timeouts return 504. Invalid 101 handshakes still return 502.
+
 ## [2.2.0] - 2026-08-28
 
 ### Added

@@ -48,7 +48,8 @@ pub struct ProxyPolicy {
     /// How `X-Forwarded-For` is handled. See [`XForwardedFor`].
     pub x_forwarded_for: XForwardedFor,
     /// How long to wait when establishing an upstream WebSocket connection
-    /// before failing the client's upgrade request. Default: 5 seconds.
+    /// and receiving its handshake response before returning 504. The smaller
+    /// of this and upstream_timeout applies. Default: 5 seconds.
     pub websocket_connect_timeout: Duration,
     /// The scheme (`http`/`https`) this proxy is publicly served over, used
     /// for `X-Forwarded-Proto` and the `proto=` directive of the `Forwarded`
@@ -276,6 +277,10 @@ impl<C: Connect + Clone + Send + Sync + 'static> ReverseProxy<C> {
     ///     client,
     /// );
     /// ```
+    /// WebSocket handshakes use this same client, connector, and TLS configuration.
+    /// WebSockets require HTTP/1.1; configure the connector's ALPN accordingly.
+    /// This client retains its pooling/retry behavior. For authorization tied to
+    /// one already-connected peer, use [crate::proxy_request_on_stream].
     pub fn new_with_client<P, T>(path: P, target: T, client: Client<C, Body>) -> Self
     where
         P: Into<String>,

@@ -343,6 +343,29 @@ pub(crate) async fn forward_request<C>(
 where
     C: Connect + Clone + Send + Sync + 'static,
 {
+    forward_with(upstream_uri, req, policy, |req| async {
+        client
+            .request(req)
+            .await
+            .map(|res| res.map(Body::new))
+            .map_err(|e| ProxyError {
+                message: error_chain(&e),
+                is_connect: e.is_connect(),
+            })
+    })
+    .await
+}
+
+async fn forward_with<F, Fut>(
+    mut upstream_uri: Uri,
+    mut req: Request<Body>,
+    policy: &ProxyPolicy,
+    send: F,
+) -> Result<Response<Body>, Infallible>
+where
+    F: FnOnce(Request<Body>) -> Fut,
+    Fut: std::future::Future<Output = Result<Response<Body>, ProxyError>>,
+{
     trace!(
         "Forwarding request method={} to={}",
         req.method(),
@@ -384,23 +407,19 @@ where
             .unwrap());
     }
 
-    // Check if this is a WebSocket upgrade request
-    if websocket::is_websocket_upgrade(req.headers()) {
-        trace!("Detected WebSocket upgrade request");
-        match websocket::handle_websocket_with_upstream_uri(req, upstream_uri, policy).await {
-            Ok(response) => return Ok(response),
-            Err(e) => {
-                error!("Failed to handle WebSocket upgrade: {}", e);
-                let mut response = Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from("WebSocket upgrade failed"))
-                    .unwrap();
-                response.extensions_mut().insert(ProxyError {
-                    message: e.to_string(),
-                    is_connect: false,
-                });
-                return Ok(response);
-            }
+    let upgrading = websocket::is_websocket_upgrade(req.headers());
+    let downstream_upgrade = upgrading.then(|| hyper::upgrade::on(&mut req));
+    if upgrading {
+        // Legacy clients accept HTTP schemes, including for WebSocket handshakes.
+        let scheme = match upstream_uri.scheme_str() {
+            Some("ws") => Some(http::uri::Scheme::HTTP),
+            Some("wss") => Some(http::uri::Scheme::HTTPS),
+            _ => None,
+        };
+        if let Some(scheme) = scheme {
+            let mut parts = upstream_uri.into_parts();
+            parts.scheme = Some(scheme);
+            upstream_uri = Uri::from_parts(parts).expect("valid HTTP URI");
         }
     }
 
@@ -414,6 +433,23 @@ where
     let mut headers = build_forward_headers(&parts.headers, client_addr, client_authority, policy);
     if let Some(pseudonym) = &policy.via {
         append_via(&mut headers, parts.version, pseudonym);
+    }
+
+    if upgrading {
+        websocket::upgrade_headers(&mut headers);
+    }
+    if !headers.contains_key(http::header::HOST)
+        && let Some(authority) = upstream_uri.authority()
+    {
+        headers.insert(
+            http::header::HOST,
+            HeaderValue::from_str(&policy.forwarded_host(
+                &headers,
+                None,
+                authority.as_str().to_owned(),
+            ))
+            .unwrap(),
+        );
     }
 
     // Cap streaming bodies (no declared length) mid-flight; an oversized body
@@ -432,8 +468,20 @@ where
 
     // Send the request, optionally bounded by the upstream response-header
     // deadline.
-    let result = match policy.upstream_timeout {
-        Some(deadline) => match tokio::time::timeout(deadline, client.request(forward_req)).await {
+    let deadline = if upgrading {
+        Some(
+            policy
+                .upstream_timeout
+                .map_or(policy.websocket_connect_timeout, |timeout| {
+                    timeout.min(policy.websocket_connect_timeout)
+                }),
+        )
+    } else {
+        policy.upstream_timeout
+    };
+    let sending = send(forward_req);
+    let result = match deadline {
+        Some(deadline) => match tokio::time::timeout(deadline, sending).await {
             Ok(result) => result,
             Err(_) => {
                 error!(
@@ -451,11 +499,19 @@ where
                 return Ok(response);
             }
         },
-        None => client.request(forward_req).await,
+        None => sending.await,
     };
 
     match result {
-        Ok(res) => {
+        Ok(mut res) => {
+            if res.status() == StatusCode::SWITCHING_PROTOCOLS {
+                if !upgrading || !websocket::valid_upgrade_response(res.headers(), &parts.headers) {
+                    return Ok(proxy_failure("Invalid upstream WebSocket upgrade"));
+                }
+                let upstream_upgrade = hyper::upgrade::on(&mut res);
+                websocket::bridge(downstream_upgrade.unwrap(), upstream_upgrade);
+            }
+
             trace!(
                 "Received response status={} version={:?}",
                 res.status(),
@@ -464,6 +520,9 @@ where
 
             let (mut parts, body) = res.into_parts();
             strip_hop_by_hop_response_headers(&mut parts.headers);
+            if parts.status == StatusCode::SWITCHING_PROTOCOLS {
+                websocket::upgrade_headers(&mut parts.headers);
+            }
             if let Some(pseudonym) = &policy.via {
                 append_via(&mut parts.headers, parts.version, pseudonym);
             }
@@ -479,19 +538,140 @@ where
         Err(e) => {
             error!(
                 "Proxy error forwarding {} request: {}",
-                parts.method,
-                error_chain(&e)
+                parts.method, e.message
             );
             let mut response = Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from("Bad Gateway"))
                 .unwrap();
             response.extensions_mut().insert(ProxyError {
-                message: error_chain(&e),
-                is_connect: e.is_connect(),
+                message: e.message,
+                is_connect: e.is_connect,
             });
             Ok(response)
         }
+    }
+}
+
+fn proxy_failure(message: &str) -> Response<Body> {
+    let mut response = Response::new(Body::from("Bad Gateway"));
+    *response.status_mut() = StatusCode::BAD_GATEWAY;
+    response.extensions_mut().insert(ProxyError {
+        message: message.to_owned(),
+        is_connect: false,
+    });
+    response
+}
+
+/// Proxy exactly one request over an already-connected, authorized stream.
+///
+/// Connect and validate the actual peer and application identity before calling.
+/// No I/O happens until this future is polled; then HTTP headers/body may be
+/// written immediately. The absolute URI supplies Host and the final path/query
+/// only (no mount-prefix rewriting). This function never resolves, connects,
+/// pools, retries, or falls back to another transport.
+///
+/// The stream must speak HTTP/1.1. HTTP/2, HTTP/3 and CONNECT are unsupported.
+/// TLS is entirely the caller's responsibility: pass an established TLS stream,
+/// negotiate HTTP/1.1 with ALPN, and validate certificates yourself. An HTTPS URI
+/// does not enable TLS. TLS negotiation writes protocol bytes; perform any checks
+/// required before those bytes before starting TLS.
+///
+/// Ownership transfers to the proxy; Send + 'static is required because a Tokio
+/// task drives the stream. Bodies stream without buffering. Dropping the future
+/// or response body closes the connection. A successful WebSocket upgrade
+/// transfers ownership to a byte tunnel until EOF/error. Downstream must support
+/// hyper upgrades (as axum does). Half-closes drain the other direction; frames
+/// are never interpreted. Upgrade completion has a five-second timeout.
+///
+/// Policy, header sanitation, body limits and response-header deadlines match
+/// ordinary requests. Errors return 502/504 responses containing [ProxyError].
+/// Authorization remains the caller's responsibility. Use a stream with fixed
+/// identity: this API cannot prevent a stream implementation reconnecting itself.
+pub async fn proxy_request_on_stream<S>(
+    upstream_uri: Uri,
+    req: Request<Body>,
+    stream: S,
+    policy: &ProxyPolicy,
+) -> Result<Response<Body>, Infallible>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    forward_with(upstream_uri, req, policy, |mut request| async move {
+        *request.uri_mut() = request
+            .uri()
+            .path_and_query()
+            .map(|path| path.as_str())
+            .unwrap_or("/")
+            .parse()
+            .unwrap();
+        *request.version_mut() = http::Version::HTTP_11;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .map_err(stream_error)?;
+        let task = tokio::spawn(async move {
+            if let Err(error) = connection.with_upgrades().await {
+                trace!(%error, "Single-request connection closed");
+            }
+        });
+        let mut guard = ConnectionGuard(Some(task.abort_handle()));
+        let response = sender.send_request(request).await.map_err(stream_error)?;
+        drop(sender);
+        if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            // The driver completes the upgrade; the bridge owns cleanup.
+            guard.0.take();
+            Ok(response.map(Body::new))
+        } else {
+            Ok(response.map(|body| {
+                Body::new(ConnectionBody {
+                    body,
+                    _guard: guard,
+                })
+            }))
+        }
+    })
+    .await
+}
+
+fn stream_error(error: hyper::Error) -> ProxyError {
+    ProxyError {
+        message: error_chain(&error),
+        is_connect: false,
+    }
+}
+
+struct ConnectionGuard(Option<tokio::task::AbortHandle>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+struct ConnectionBody {
+    body: hyper::body::Incoming,
+    _guard: ConnectionGuard,
+}
+
+impl http_body::Body for ConnectionBody {
+    type Data = bytes::Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
     }
 }
 

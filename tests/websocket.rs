@@ -259,9 +259,8 @@ async fn test_websocket_with_complex_connection_header() {
 
 #[tokio::test]
 async fn test_websocket_with_https_returns_error() {
-    // tokio_tungstenite does not have TLS features enabled, so WebSocket
-    // proxying to wss:// upstreams is expected to fail. The proxy should
-    // return an error response instead of a misleading 101.
+    // This upstream speaks plaintext, so a TLS handshake must fail.
+    // WebSockets now use the configured hyper client's TLS implementation.
     let (_upstream_addr, proxy_addr) = setup_test_server("https://").await;
 
     let url = format!("ws://127.0.0.1:{}/ws", proxy_addr.port());
@@ -269,9 +268,9 @@ async fn test_websocket_with_https_returns_error() {
 
     assert!(
         result.is_err(),
-        "Expected error when proxying to HTTPS upstream without TLS support"
+        "Expected error when using TLS against a plaintext upstream"
     );
-    debug!("Correctly rejected HTTPS upstream without TLS support");
+    debug!("Correctly rejected TLS against a plaintext upstream");
 }
 
 #[tokio::test]
@@ -552,4 +551,150 @@ async fn test_websocket_close_code_forwarded() {
         }
         other => panic!("expected close frame with code/reason, got {other:?}"),
     }
+}
+
+/// A custom transport redirects an otherwise unreachable authority. Both the
+/// handshake and subsequent frames must use that connection.
+#[tokio::test]
+async fn websocket_uses_custom_connector_and_selected_subprotocol() {
+    use hyper_util::{
+        client::legacy::Client,
+        rt::{TokioExecutor, TokioIo},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        let app = Router::new().route(
+            "/ws",
+            get(|ws: WebSocketUpgrade| async { ws.protocols(["chat"]).on_upgrade(handle_socket) }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let connector = tower::service_fn(move |uri: Uri| {
+        assert_eq!(uri.host(), Some("unused.invalid"));
+        counter.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            tokio::net::TcpStream::connect(address)
+                .await
+                .map(TokioIo::new)
+        })
+    });
+    let client = Client::builder(TokioExecutor::new()).build(connector);
+    let proxy = ReverseProxy::new_with_client("/", "http://unused.invalid", client);
+    let app: Router = proxy.into();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let proxy_server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut request = format!("ws://{address}/ws").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("sec-websocket-protocol", "other, chat".parse().unwrap());
+    let (mut socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+    assert_eq!(response.headers()["sec-websocket-protocol"], "chat");
+    socket
+        .send(tungstenite::Message::Text("via connector".into()))
+        .await
+        .unwrap();
+    let message = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(message, tungstenite::Message::Text("via connector".into()));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(socket);
+    proxy_server.abort();
+    upstream.abort();
+}
+
+/// A private CA trusted only by the configured client must also work for WSS.
+#[cfg(all(feature = "tls", not(feature = "native-tls")))]
+#[tokio::test]
+async fn websocket_uses_configured_tls_trust() {
+    use hyper_util::{
+        client::legacy::Client,
+        rt::{TokioExecutor, TokioIo},
+    };
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let certificate = CertificateDer::from(cert.cert);
+    let key = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.clone()], key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let stream = acceptor.accept(stream).await.unwrap();
+        let app = Router::new().route(
+            "/ws",
+            get(|ws: WebSocketUpgrade| async { ws.on_upgrade(handle_socket) }),
+        );
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                hyper::service::service_fn(move |req| {
+                    let app = app.clone();
+                    async move { app.oneshot(req).await }
+                }),
+            )
+            .with_upgrades()
+            .await
+            .unwrap();
+    });
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certificate).unwrap();
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_only()
+        .enable_http1()
+        .build();
+    let client = Client::builder(TokioExecutor::new()).build(connector);
+    let proxy =
+        ReverseProxy::new_with_client("/", format!("https://localhost:{}", address.port()), client);
+    let app: Router = proxy.into();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let proxy_server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (mut socket, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio_tungstenite::connect_async(format!("ws://{address}/ws")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    socket
+        .send(tungstenite::Message::Text("private TLS".into()))
+        .await
+        .unwrap();
+    let echoed = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(echoed, tungstenite::Message::Text("private TLS".into()));
+    drop(socket);
+    proxy_server.abort();
+    upstream.abort();
 }

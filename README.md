@@ -28,6 +28,66 @@ This is a **library, not a proxy server**. It deliberately does not compete with
 - 📋 Optional `Via` header emission and loop detection (RFC 9110 §7.6.3)
 - 🔧 Full Tower middleware support
 
+## Proxying an authorized connection
+
+Use `proxy_request_on_stream(upstream_uri, request, stream, &policy)` when
+authorization depends on the connection you actually opened. Connect to the
+specific peer, recheck its identity and authorization, then pass that stream to
+the proxy. This HTTP/1.1 API owns the stream and sends exactly one request: it
+has no DNS lookup, connection pool, reconnect, retry, or fallback. The absolute
+URI supplies Host and the final path/query; it does not select a connection.
+
+```rust,no_run
+use axum::body::Body;
+use axum_reverse_proxy::{proxy_request_on_stream, ProxyPolicy};
+use http::{Request, Response};
+use std::net::SocketAddr;
+use tokio::net::TcpStream;
+
+async fn forward(
+    req: Request<Body>,
+    selected_peer: SocketAddr,
+    authorize: impl FnOnce(SocketAddr) -> bool,
+) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+    let stream = TcpStream::connect(selected_peer).await?;
+    // Recheck application identity (e.g. UID and IP) here, after connecting.
+    if !authorize(stream.peer_addr()?) {
+        return Ok(Response::builder().status(403).body(Body::empty())?);
+    }
+    Ok(proxy_request_on_stream(
+        "http://backend.internal/final/path".parse()?,
+        req, stream, &ProxyPolicy::default(),
+    ).await?)
+}
+```
+
+No proxy I/O occurs until the returned future is polled; request bytes may be
+written immediately once it is polled. TLS is the caller's responsibility:
+an HTTPS URI does not encrypt a stream. For TLS, validate certificates and
+negotiate HTTP/1.1 before handing over the TLS stream. TLS handshakes themselves
+write bytes, so checks that must precede *all* protocol bytes belong before TLS.
+Any stream implementing Tokio AsyncRead + AsyncWrite + Unpin + Send + 'static
+is accepted, including TCP, Unix sockets, TLS, and test streams. The stream
+implementation must itself maintain a fixed peer identity.
+
+Bodies remain streaming. Dropping the forwarding future or response body closes
+the owned connection. Successful WebSocket upgrades transfer the connection to
+a tunnel, which runs until EOF/error; half-closes drain the other direction.
+Upgrade completion is bounded to five seconds. There is no tunnel idle timeout.
+HTTP/2, HTTP/3, CONNECT, and RFC 8441 extended CONNECT are unsupported by this API.
+
+WebSocket requests now use the same configured hyper client/connector and TLS
+settings as ordinary requests, including clients supplied to `new_with_client`.
+Configure that client/connector for HTTP/1.1 when using WebSockets; HTTP/2
+WebSocket upgrades are unsupported. The ordinary client API still has its
+configured pooling/retry behavior; use the stream API for per-connection
+authorization. Both paths preserve the upstream accept key, selected subprotocol,
+extensions, and end-to-end response headers. Raw bytes are copied without
+reframing, remasking, or generating ping/pong/close frames. Hop-by-hop headers
+are stripped, then Connection/Upgrade are restored for the handshake only.
+Non-101 upstream responses retain their status, headers, and streaming body;
+invalid 101 handshakes return 502. Handshake timeouts return 504.
+
 ## Installation
 
 Run `cargo add axum-reverse-proxy` to add the library to your project.
@@ -206,7 +266,7 @@ This crate follows clear rules for joining the incoming request path with the co
 - Join: append the remainder to `T`’s path verbatim; do not re-encode segments; preserve case and interior slashes.
 - Query: append `?Q` exactly as received; the presence of a query does not force a `/` when the remainder is empty.
 - Dot-segments: normalization is left to underlying HTTP stacks; the proxy does not add its own normalization.
-- WebSocket: the same path+query join logic applies; schemes are mapped `http→ws` and `https→wss`.
+- WebSocket: the same path+query join logic applies; upstream `ws`/`wss` schemes are normalized to `http`/`https` for the configured hyper client.
 
 These rules are enforced by a single code path that builds the upstream URI using `http::Uri` to avoid stringly-typed errors. See tests under `tests/routing.rs` and `tests/websocket.rs` for coverage of edge cases (queries, trailing slashes, boundary stripping, mount vs fallback, and WebSocket parity).
 

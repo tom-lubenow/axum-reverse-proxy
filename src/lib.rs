@@ -251,7 +251,16 @@
 //!
 //! # WebSocket Support
 //!
-//! The proxy automatically detects WebSocket upgrade requests and handles them appropriately:
+//! WebSocket handshakes use the same configured hyper client/connector as HTTP
+//! requests, including its TLS configuration. HTTP/1.1 upgrades are supported;
+//! RFC 8441 extended CONNECT is not. Configure custom connectors for HTTP/1.1
+//! when using WebSockets. Upgraded streams are copied byte-for-byte, preserving
+//! negotiated subprotocols and extensions without interpreting frames.
+//!
+//! For per-connection authorization, use [proxy_request_on_stream] after opening
+//! and validating the peer. It forwards one request without pooling or reconnecting.
+//!
+//! The proxy automatically detects WebSocket upgrade requests:
 //!
 //! ```rust
 //! use axum::Router;
@@ -332,7 +341,7 @@ pub use danger::create_dangerous_native_tls_connector;
 pub use danger::create_dangerous_rustls_config;
 #[cfg(feature = "dns")]
 pub use dns_discovery::{DnsDiscovery, DnsDiscoveryConfig, StaticDnsDiscovery};
-pub use forward::ProxyError;
+pub use forward::{ProxyError, proxy_request_on_stream};
 pub use proxy::{HostBehaviour, ProxyPolicy, ReverseProxy, XForwardedFor};
 pub use retry::RetryLayer;
 #[allow(deprecated)]
