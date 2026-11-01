@@ -86,6 +86,9 @@ impl ProxyError {
 pub(crate) fn create_http_connector() -> ProxyConnector {
     let mut connector = HttpConnector::new();
     connector.set_nodelay(true);
+    // Only a TLS wrapper may accept https URIs. Without TLS features, reject
+    // them rather than silently sending the request over plaintext.
+    #[cfg(any(feature = "tls", feature = "native-tls"))]
     connector.enforce_http(false);
     connector.set_keepalive(Some(std::time::Duration::from_secs(60)));
     connector.set_connect_timeout(Some(std::time::Duration::from_secs(10)));
@@ -366,6 +369,12 @@ where
     F: FnOnce(Request<Body>) -> Fut,
     Fut: std::future::Future<Output = Result<Response<Body>, ProxyError>>,
 {
+    let mut guard = req
+        .extensions_mut()
+        .remove::<crate::TunnelGuard>()
+        .and_then(crate::TunnelGuard::take);
+    let cancellation = req.extensions_mut().remove::<crate::TunnelCancellation>();
+
     trace!(
         "Forwarding request method={} to={}",
         req.method(),
@@ -509,7 +518,12 @@ where
                     return Ok(proxy_failure("Invalid upstream WebSocket upgrade"));
                 }
                 let upstream_upgrade = hyper::upgrade::on(&mut res);
-                websocket::bridge(downstream_upgrade.unwrap(), upstream_upgrade);
+                websocket::bridge(
+                    downstream_upgrade.unwrap(),
+                    upstream_upgrade,
+                    guard.take(),
+                    cancellation,
+                );
             }
 
             trace!(
@@ -529,7 +543,7 @@ where
 
             // Wrap the upstream body directly (rather than as a data stream)
             // so trailer frames survive — gRPC needs them.
-            let mut response = Response::new(Body::new(body));
+            let mut response = Response::new(crate::lifecycle::retain(body, guard));
             *response.status_mut() = parts.status;
             *response.version_mut() = parts.version;
             *response.headers_mut() = parts.headers;

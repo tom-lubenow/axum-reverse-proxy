@@ -88,6 +88,58 @@ are stripped, then Connection/Upgrade are restored for the handshake only.
 Non-101 upstream responses retain their status, headers, and streaming body;
 invalid 101 handshakes return 502. Handshake timeouts return 504.
 
+## Request and tunnel lifetimes
+
+Insert `TunnelGuard::new(owned_resource)` into request extensions from any Tower
+layer. A resource can be an owned semaphore permit, a drop-based metrics guard,
+or a tuple of both; it only needs `Send + 'static`. The proxy takes it before
+sending upstream. Ordinary responses (including non-101 upgrade rejections)
+retain it until body completion/error/drop; known-empty bodies release immediately.
+A valid 101 transfers it to the tunnel task until upgrade failure, the five-second
+upgrade-completion timeout, or actual tunnel teardown. Forwarding failures release
+immediately. This works with pooled/custom clients and `proxy_request_on_stream`.
+
+```rust
+use axum_reverse_proxy::{TunnelGuard, TunnelCancellation};
+use tokio_util::sync::CancellationToken;
+# async fn attach(req: &mut http::Request<axum::body::Body>, permits: std::sync::Arc<tokio::sync::Semaphore>, shutdown: CancellationToken) {
+let permit = permits.acquire_owned().await.unwrap();
+req.extensions_mut().insert(TunnelGuard::new(permit));
+req.extensions_mut().insert(TunnelCancellation(shutdown.clone()));
+# }
+```
+
+See [the runnable Tower middleware example](examples/tunnel_lifecycle.rs) for
+admission, an active-request counter, and explicit shutdown. These are
+request/user resources, independent of pooled connection counts. The library
+does not choose tenant identities or enforce per-tenant limits.
+
+`TunnelGuard` clones share a single-consumption slot: the first forwarding attempt
+owns the resource, and retained extension clones cannot keep it alive afterward.
+Use a fresh guard for each request/attempt; put admission inside a retry layer
+when each retry should acquire its own permit. If no attempt consumes it, the
+last clone releases it. Drop-based observations cover normal unwinding and task
+cancellation, not process aborts or forgotten values. Body completion means frames
+were yielded by the proxy, not consumed by the downstream client.
+
+`TunnelCancellation` wraps a `tokio_util::sync::CancellationToken` (enable its
+`rt` feature). It only affects successful tunnels after a valid 101: it watches
+both upgrade completion and copying. An already-cancelled token still allows the
+HTTP handshake and immediately tears down any resulting tunnel. Ordinary
+responses, upstream rejections, and response-header waits are unaffected (use
+`ProxyPolicy` deadlines for those waits). Cancellation drops tunnel transports,
+may discard buffered bytes, and sends no WebSocket close frame. During upgrade
+waiting, hyper still owns any transport not yet handed over; dropping its upgrade
+receiver causes that transport to be dropped when handover occurs. The guard
+may release before that happens: zero outstanding guards is **not** proof that
+all HTTP transports have closed. Bound server/connection-driver shutdown
+separately if that is required. Cancellation
+wins when observed ready alongside copying, but cannot recall bytes already sent
+or a 101 already returned. Without cancellation, buffered bytes and half-close
+draining behave as before. Dropping a 101 response does not cancel an established
+tunnel. Stop admission, signal tokens if desired, and wait on caller-owned guards
+for shutdown; graceful draining is not automatic.
+
 ## Installation
 
 Run `cargo add axum-reverse-proxy` to add the library to your project.

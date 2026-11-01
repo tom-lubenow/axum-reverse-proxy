@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-11-01
+
+### Added
+
+- Request-extension `TunnelGuard` retains owned permits/metrics through ordinary
+  response bodies or actual upgraded tunnel teardown, with single-consumption
+  clone semantics.
+- Optional `TunnelCancellation` cancels upgrade completion and active byte tunnels.
+  Includes an admission/counter/shutdown middleware example and lifecycle tests
+  for both custom-client and caller-connected stream forwarding.
+
+### Fixed
+
+- Without TLS features, the default connector rejects HTTPS targets instead of
+  silently sending plaintext. Custom connectors remain caller-controlled.
+- Native-TLS-only test builds use the TLS fixture's rustls re-export rather than
+  requiring the proxy's optional rustls dependency.
+
 ## [2.3.0] - 2026-10-31
 
 ### Added

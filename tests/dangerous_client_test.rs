@@ -19,8 +19,15 @@ mod tests {
 
     // Create a test server with self-signed certificate
     async fn start_https_test_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-        use tokio_rustls::TlsAcceptor;
+        // The local TLS fixture uses tokio-rustls even when only native-tls
+        // is enabled for the proxy (the optional direct rustls dep is absent).
+        use tokio_rustls::{
+            TlsAcceptor,
+            rustls::{
+                self,
+                pki_types::{CertificateDer, PrivateKeyDer},
+            },
+        };
 
         // Generate self-signed certificate for testing
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
