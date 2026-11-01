@@ -323,6 +323,7 @@ mod danger;
 #[cfg(feature = "dns")]
 mod dns_discovery;
 mod forward;
+mod lifecycle;
 mod proxy;
 mod retry;
 mod rfc9110;
@@ -342,6 +343,7 @@ pub use danger::create_dangerous_rustls_config;
 #[cfg(feature = "dns")]
 pub use dns_discovery::{DnsDiscovery, DnsDiscoveryConfig, StaticDnsDiscovery};
 pub use forward::{ProxyError, proxy_request_on_stream};
+pub use lifecycle::{TunnelCancellation, TunnelGuard};
 pub use proxy::{HostBehaviour, ProxyPolicy, ReverseProxy, XForwardedFor};
 pub use retry::RetryLayer;
 #[allow(deprecated)]

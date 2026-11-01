@@ -1,6 +1,6 @@
 [package]
 name = "axum-reverse-proxy"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A flexible and efficient reverse proxy implementation for Axum web applications"
@@ -27,6 +27,7 @@ native-tls = { version = "^0.2", optional = true }
 rustls = { version = "^0.23", optional = true }
 tokio = { version = "^1.45", features = ["full"] }
 tokio-native-tls = { version = "^0.3", optional = true }
+tokio-util = { version = "^0.7", features = ["rt"] }
 tokio-tungstenite = "^0.28"
 tower = { version = "^0.5", features = ["full"] }
 tracing = "^0.1"

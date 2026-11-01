@@ -49,26 +49,45 @@ pub(crate) fn valid_upgrade_response(headers: &HeaderMap, request: &HeaderMap) -
             })
 }
 
-pub(crate) fn bridge(downstream: OnUpgrade, upstream: OnUpgrade) {
+pub(crate) fn bridge(
+    downstream: OnUpgrade,
+    upstream: OnUpgrade,
+    guard: Option<crate::lifecycle::Resource>,
+    cancellation: Option<crate::TunnelCancellation>,
+) {
     tokio::spawn(async move {
-        // Bound upgrade completion; on failure both sides are dropped together.
-        match timeout(Duration::from_secs(5), async {
-            tokio::try_join!(downstream, upstream)
-        })
-        .await
-        {
-            Ok(Ok((downstream, upstream))) => {
-                let mut downstream = TokioIo::new(downstream);
-                let mut upstream = TokioIo::new(upstream);
-                // Includes hyper's buffered bytes. EOF shuts down the opposite
-                // writer while the remaining direction drains; errors drop both.
-                if let Err(error) =
-                    tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await
-                {
-                    tracing::debug!(%error, "WebSocket tunnel closed");
+        // Declared before the tunnel future so transports are dropped before
+        // the caller observes resource release, including cancellation/unwind.
+        let _guard = guard;
+        let tunnel = async move {
+            // Bound upgrade completion; on failure both sides are dropped together.
+            match timeout(Duration::from_secs(5), async {
+                tokio::try_join!(downstream, upstream)
+            })
+            .await
+            {
+                Ok(Ok((downstream, upstream))) => {
+                    let mut downstream = TokioIo::new(downstream);
+                    let mut upstream = TokioIo::new(upstream);
+                    // Includes hyper's buffered bytes. EOF shuts down the opposite
+                    // writer while the remaining direction drains; errors drop both.
+                    if let Err(error) =
+                        tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await
+                    {
+                        tracing::debug!(%error, "WebSocket tunnel closed");
+                    }
                 }
+                result => tracing::debug!(?result, "WebSocket upgrade failed"),
             }
-            result => tracing::debug!(?result, "WebSocket upgrade failed"),
+        };
+        if let Some(cancellation) = cancellation {
+            tokio::select! {
+                biased;
+                _ = cancellation.0.cancelled() => {},
+                _ = tunnel => {},
+            }
+        } else {
+            tunnel.await;
         }
     });
 }
